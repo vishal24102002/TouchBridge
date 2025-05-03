@@ -1,7 +1,7 @@
 # TouchBridge
 TouchBridge is a lightweight and intuitive mobile-to-PC remote control system that transforms your smartphone into a wireless keyboard and mouse. Designed for ease and speed, TouchBridge bridges your phone and computer over Wi-Fi, enabling seamless input from anywhere in the room.
 
-🔧 Features:
+## 🔧 Features:
 <ol>
 <li>Touchpad Interface – Move your PC cursor with simple finger swipes.</li>
 
@@ -14,7 +14,7 @@ TouchBridge is a lightweight and intuitive mobile-to-PC remote control system th
 <li>Live Socket Communication – Ensures real-time input with minimal lag.</li>
 </ol>
 
-🚀 Ideal Use Cases:
+## 🚀 Ideal Use Cases:
 <ul>
 <li>Giving presentations without a physical mouse.</li>
 
@@ -23,7 +23,7 @@ TouchBridge is a lightweight and intuitive mobile-to-PC remote control system th
 <li>Quick typing or navigation when your main keyboard isn't accessible.</li>
 </ul>
 
-✅ How to Use TouchBridge (Quick Setup)
+## ✅ How to Use TouchBridge (Quick Setup)
 <ol>
 <li>Start the Server</li> 
 On your PC, run server.py to start the listener.
@@ -45,7 +45,7 @@ Open the TouchBridge app → Enter your PC's IP address → Tap Connect.
 
 Built using Flutter for the mobile interface and Python with PyAutoGUI for the server-side, TouchBridge is a cross-platform tool designed for developers, students, and everyday users who want smarter, wireless control.
 
-💡 Got Ideas?<br>
+## 💡 Got Ideas?<br>
   Have a cool feature in mind that could make TouchBridge even better?<br>
   👉 Feel free to suggest it by creating an issue or pull request!<br>
   Let's build this together. 🚀
