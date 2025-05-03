@@ -44,3 +44,8 @@ Open the TouchBridge app → Enter your PC's IP address → Tap Connect.
 ⚠️ Make sure both your PC and phone are on the same Wi-Fi network.
 
 Built using Flutter for the mobile interface and Python with PyAutoGUI for the server-side, TouchBridge is a cross-platform tool designed for developers, students, and everyday users who want smarter, wireless control.
+
+💡 Got Ideas?<br>
+  Have a cool feature in mind that could make TouchBridge even better?<br>
+  👉 Feel free to suggest it by creating an issue or pull request!<br>
+  Let's build this together. 🚀
