@@ -29,7 +29,7 @@ TouchBridge is a lightweight and intuitive mobile-to-PC remote control system th
 On your PC, run server.py to start the listener.
 
 <li>Connect from Phone</li>
-<a href="">App Link</a><br>
+<button><a href=""><img src="https://img.shields.io/badge/📱  App  📱-Link-blue?style=for-the-badge"></a></button><br>
 Open the TouchBridge app → Enter your PC's IP address → Tap Connect.
 
 <li>Use the Controls</li>
