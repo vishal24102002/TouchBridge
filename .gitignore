@@ -73,4 +73,3 @@ coverage/
 .main_cache/
 python-server/venv/
 .notebook
-python-server/venv/
