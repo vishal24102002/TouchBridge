@@ -1,0 +1,8 @@
+opencv-python>=4.8.0
+mss>=9.0.1
+pyautogui>=0.9.54
+numpy>=1.24.0
+Pillow>=10.0.0
+colorama>=0.4.6
+pyscreenshot>=3.1; sys_platform == "linux"
+python-xlib>=0.33; sys_platform == "linux"

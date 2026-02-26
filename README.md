@@ -1,52 +1,41 @@
-# TouchBridge
-TouchBridge is a lightweight and intuitive mobile-to-PC remote control system that transforms your smartphone into a wireless keyboard and mouse. Designed for ease and speed, TouchBridge bridges your phone and computer over Wi-Fi, enabling seamless input from anywhere in the room.
+# ⬡ TouchBridge
 
-## 🔧 Features:
-<ol>
-<li>Touchpad Interface – Move your PC cursor with simple finger swipes.</li>
+Modern Remote Desktop — Electron + React + Python (`server_2.py`)
 
-<li>Keyboard Input – Type directly into your PC using your mobile keyboard.</li>
+## Quick Start
 
-<li>Left & Right Click Buttons – Perform full mouse interactions with dedicated buttons.</li>
+```bash
+# Linux / macOS
+chmod +x start.sh && ./start.sh
 
-<li>Custom IP Connection – Connect to any PC on your network by entering its IP address.</li>
+# Windows
+start.bat
+```
 
-<li>Live Socket Communication – Ensures real-time input with minimal lag.</li>
-</ol>
+## Architecture
 
-## 🚀 Ideal Use Cases:
-<ul>
-<li>Giving presentations without a physical mouse.</li>
+- **Python server** (`server_2.py`) — TCP server on ports 8080 (screen) + 9999 (control)
+  - X11: `xdotool` for input simulation
+  - Wayland: `ydotool` for input simulation
+  - Windows: `pyautogui` native
+- **Electron main** — spawns Python, bridges TCP via IPC handlers
+- **React UI** — 5 color themes, Server/Client modes, full shortcut panel
 
-<li>Controlling media playback from your bed or couch.</li>
+## Themes
+🖤 Obsidian · 🌌 Aurora · 🔥 Ember · 🧊 Arctic · 💚 Matrix
 
-<li>Quick typing or navigation when your main keyboard isn't accessible.</li>
-</ul>
+## Ports
+| Port | Purpose |
+|------|---------|
+| 8080 | Screen capture (JPEG over TCP) |
+| 9999 | Remote control commands |
 
-## ✅ How to Use TouchBridge (Quick Setup)
-<ol>
-<li>Start the Server</li> 
-On your PC, run server.py to start the listener.
+## Linux Setup
+```bash
+# X11
+sudo apt install xdotool
 
-<li>Connect from Phone</li>
-<button><a href=""><img src="https://img.shields.io/badge/📱  App  📱-Link-blue?style=for-the-badge"></a></button><br>
-Open the TouchBridge app → Enter your PC's IP address → Tap Connect.
-
-<li>Use the Controls</li>
-<ul>
-<li>Swipe on the touchpad to move the mouse.</li>
-
-<li>Tap Left Click or Right Click buttons.</li>
-
-<li>Type in the text box to send keyboard input.</li>
-</ul>
-</ol>
-
-⚠️ Make sure both your PC and phone are on the same Wi-Fi network.
-
-Built using Flutter for the mobile interface and Python with PyAutoGUI for the server-side, TouchBridge is a cross-platform tool designed for developers, students, and everyday users who want smarter, wireless control.
-
-## 💡 Got Ideas?<br>
-  Have a cool feature in mind that could make TouchBridge even better?<br>
-  👉 Feel free to suggest it by creating an issue or pull request!<br>
-  Let's build this together. 🚀
+# Wayland
+sudo apt install ydotool
+sudo systemctl enable --now ydotoold
+```
