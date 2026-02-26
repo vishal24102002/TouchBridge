@@ -71,3 +71,5 @@ coverage/
 # =========================
 .renderer_cache/
 .main_cache/
+python-server/venv/
+.notebook
