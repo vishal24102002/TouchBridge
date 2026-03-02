@@ -152,7 +152,7 @@ export default function SettingsPage() {
             <div>
               <div className="settings-section-title">About</div>
               <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--r)', padding: 16, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-2)', lineHeight: 1.9 }}>
-                <div><span style={{ color: 'var(--accent)' }}>RemoteDeck</span> v1.0.0</div>
+                <div><span style={{ color: 'var(--accent)' }}>TouchBridge</span> v1.0.0</div>
                 <div>Electron + React + Python backend</div>
                 <div>TCP sockets: port 8080 (screen) + 9999 (control)</div>
                 <div style={{ color: 'var(--text-3)' }}>Linux (X11/Wayland) · Windows · macOS</div>

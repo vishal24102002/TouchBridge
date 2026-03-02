@@ -111,7 +111,7 @@ export default function ServerPage() {
         <div className="box">
           <div className="box-title">How Remote Users Connect</div>
           <div style={{ fontSize: 11, color: 'var(--text-2)', fontFamily: 'var(--font-mono)', lineHeight: 1.9 }}>
-            <div>1. Open RemoteDeck → Client Mode</div>
+            <div>1. Open TouchBridge → Client Mode</div>
             <div>2. Enter your IP address above</div>
             <div>3. Ports: Screen=8080, Control=9999</div>
             <div>4. Click Connect</div>
