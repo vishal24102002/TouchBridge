@@ -11,13 +11,13 @@
 TouchBridge is a secure, cross-platform remote desktop application that lets you share your screen and control remote machines over a local network. It combines a Python TCP server with an Electron/React frontend for desktop and a Flutter app for Android.
 
 **Key Features:**
-- 🖥️ Real-time screen capture streamed over TCP (JPEG, port 8080)
-- 🖱️ Remote input control — keyboard, mouse, and touch (port 9999)
-- 🔀 Dual roles: Host a session (Server Mode) or join one (Client Mode)
-- 🎨 5 built-in color themes: Obsidian, Aurora, Ember, Arctic, Matrix
-- ⌨️ Native input simulation: `xdotool` (X11), `ydotool` (Wayland), `pyautogui` (Windows)
-- 📱 Connect phones, Linux machines, and Windows PCs together over a network
-- 🚀 One-click setup scripts for Linux and Windows
+- Real-time screen capture streamed over TCP (JPEG, port 8080)
+- Remote input control — keyboard, mouse, and touch (port 9999)
+- Dual roles: Host a session (Server Mode) or join one (Client Mode)
+- 5 built-in color themes: Obsidian, Aurora, Ember, Arctic, Matrix
+- Native input simulation: `xdotool` (X11), `ydotool` (Wayland), `pyautogui` (Windows)
+  Connect phones, Linux machines, and Windows PCs together over a network
+- One-click setup scripts for Linux and Windows
 
 ---
 
