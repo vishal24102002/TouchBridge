@@ -70,7 +70,7 @@ TouchBridge connects any combination of phones, Linux machines, and Windows PCs 
 
 ## Architecture
 
-| Layer | Technology |<img src="/assets/screenshots/Android_splash.jpg" alt="SplashScreen (Android)" height="400"/>
+| Layer | Technology |
 |-------|------------|
 | GUI Frontend | Electron + React (`src/App.js`, `components/`) |
 | Styling | CSS Themes (`src/App.css`) |
@@ -120,7 +120,7 @@ pip install -r requirements.txt
 
 The Home screen is the main entry point of TouchBridge.
 
-<img src="/assets/screenshots/home.png" alt="Home Screen" height="400"/> <img src="/assets/screenshots/Android_home.jpg" alt="Home Screen (Android)" height="400"/>
+<img src="/assets/screenshots/home.png" alt="Home Screen" height="400"/> <img src="/assets/screenshots/Android_splash.jpg" alt="SplashScreen (Android)" height="400"/> <img src="/assets/screenshots/Android_home.jpg" alt="Home Screen (Android)" height="400"/>
 
 *Home Screen — choose Server Mode (Host) or Client Mode (Connect Remote) · Desktop (left) and Android (right)*
 
