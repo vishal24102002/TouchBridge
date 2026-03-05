@@ -70,7 +70,7 @@ TouchBridge connects any combination of phones, Linux machines, and Windows PCs 
 
 ## Architecture
 
-| Layer | Technology |
+| Layer | Technology |<img src="/assets/screenshots/Android_splash.jpg" alt="SplashScreen (Android)" height="400"/>
 |-------|------------|
 | GUI Frontend | Electron + React (`src/App.js`, `components/`) |
 | Styling | CSS Themes (`src/App.css`) |
