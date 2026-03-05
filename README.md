@@ -120,8 +120,9 @@ pip install -r requirements.txt
 
 The Home screen is the main entry point of TouchBridge.
 
-![Home Screen](/assets/screenshots/home.png)
-*Home Screen — choose Server Mode (Host) or Client Mode (Connect Remote)*
+<img src="/assets/screenshots/home.png" alt="Home Screen" height="400"/> <img src="/assets/screenshots/Android_home.jpg" alt="Home Screen (Android)" height="400"/>
+
+*Home Screen — choose Server Mode (Host) or Client Mode (Connect Remote) · Desktop (left) and Android (right)*
 
 | Option | Description |
 |--------|-------------|
@@ -135,8 +136,9 @@ The Home screen is the main entry point of TouchBridge.
 
 Server Mode turns your machine into a remote desktop host. The Python server starts automatically, captures your screen, and streams it to connected clients.
 
-![Server Mode](/assets/screenshots/server.png)
-*Server Mode — monitor network info, server logs, and share your IP*
+<img src="/assets/screenshots/server.png" alt="Server Mode" height="400"/> <img src="/assets/screenshots/Android_server.jpg" alt="Server Mode (Android)" height="400"/>
+
+*Server Mode — monitor network info, server logs, and share your IP · Desktop (left) and Android (right)*
 
 **Left Panel — Your Network Info:**
 - **Hostname** — your machine's network name
@@ -157,8 +159,9 @@ Server Mode turns your machine into a remote desktop host. The Python server sta
 
 Client Mode connects to a remote TouchBridge server. Enter the host's IP and ports, then click Connect.
 
-![Client Mode](/assets/screenshots/client.png)
-*Client Mode — enter the server IP and click Connect to start the remote session*
+<img src="/assets/screenshots/client.png" alt="Client Mode" height="400"/> <img src="/assets/screenshots/Android_client.jpg" alt="Client Mode (Android)" height="400"/>
+
+*Client Mode — enter the server IP and click Connect to start the remote session · Desktop (left) and Android (right)*
 
 | Field | Value |
 |-------|-------|
@@ -177,8 +180,9 @@ Client Mode connects to a remote TouchBridge server. Enter the host's IP and por
 
 ### Settings & Preferences
 
-![Settings](/assets/screenshots/setting.png)
-*Settings — choose a color theme, set default ports, and view setup commands*
+<img src="/assets/screenshots/setting.png" alt="Settings" height="400"/> <img src="/assets/screenshots/Android_setting.jpg" alt="Settings (Android)" height="400"/>
+
+*Settings — choose a color theme, set default ports, and view setup commands · Desktop (left) and Android (right)*
 
 #### Color Themes
 
