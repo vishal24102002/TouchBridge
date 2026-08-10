@@ -1,8 +1,12 @@
-opencv-python>=4.8.0
-mss>=9.0.1
+# Screen capture is now done by Electron (desktopCapturer), not Python —
+# opencv-python / mss / pyscreenshot are no longer required for that.
+#
+# Python still needs pyautogui to simulate remote mouse/keyboard input.
 pyautogui>=0.9.54
-numpy>=1.24.0
-Pillow>=10.0.0
 colorama>=0.4.6
-pyscreenshot>=3.1; sys_platform == "linux"
+
+# Linux: pyautogui's X11 backend uses python-xlib under the hood.
+# (No Wayland input-injection path exists for pyautogui; if you're on a
+# Wayland session, remote input control will not work until that's added
+# via ydotool/uinput, same limitation noted in the project README.)
 python-xlib>=0.33; sys_platform == "linux"

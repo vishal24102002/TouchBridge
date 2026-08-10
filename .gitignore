@@ -6,6 +6,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+package-lock.json
 
 # =========================
 # Electron build output
@@ -73,3 +74,56 @@ coverage/
 .main_cache/
 python-server/venv/
 .notebook
+
+# =========================
+# Flutter / Dart
+# =========================
+
+.dart_tool/
+.pub-cache/
+.pub/
+.flutter-plugins
+.flutter-plugins-dependencies
+.flutter_tool_state
+
+# Flutter build output
+build/
+coverage/
+
+# =========================
+# Android / Gradle
+# =========================
+
+.gradle/
+**/.gradle/
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+android/.cxx/
+
+# Android generated files
+**/GeneratedPluginRegistrant.java
+
+# =========================
+# Android Studio / IntelliJ
+# =========================
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# =========================
+# Android signing / secrets
+# =========================
+
+*.jks
+*.keystore
+key.properties
+
+# =========================
+# Flutter / Android logs
+# =========================
+
+*.log
