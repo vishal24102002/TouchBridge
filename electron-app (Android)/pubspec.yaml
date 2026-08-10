@@ -1,0 +1,31 @@
+name: touchbridge
+description: TouchBridge - Secure Cross-Platform Remote Desktop (Android client/host)
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # Networking
+  network_info_plus: ^5.0.3      # get local IP / hostname for Server Mode
+  device_info_plus: ^10.1.0      # hostname / device name fallback
+
+  # State + persistence
+  provider: ^6.1.2
+  shared_preferences: ^2.2.3     # persist theme + connection defaults
+
+  # UI helpers
+  flutter_svg: ^2.0.10+1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
