@@ -73,9 +73,12 @@ export default function ClientPage() {
   const zoomOut = () => setZoom(z => Math.max(ZOOM_MIN, +(z - 0.25).toFixed(2)));
   const zoomReset = () => setZoom(1);
 
-  const captureInterval = useRef(null);
+  const captureTimeoutRef = useRef(null);
+  const capturingRef = useRef(false); // guards against overlapping in-flight requests
   const fpsCounter = useRef(0);
   const fpsTimer = useRef(null);
+
+  const TARGET_FRAME_MS = 200; // ~5fps ceiling — never exceeded, but we back off if a frame takes longer
 
   // Load saved host
   useEffect(() => {
@@ -108,8 +111,20 @@ export default function ClientPage() {
     startCapture();
   };
 
+  // Self-pacing loop instead of setInterval: each capture is requested only
+  // AFTER the previous one finishes (each capture-screen call is a fresh TCP
+  // round trip, and frames — especially PNG/Ultra ones — can easily take
+  // longer than 200ms). setInterval fires on a fixed clock regardless of
+  // whether the previous request has returned, so once a frame takes longer
+  // than the interval, requests start overlapping and pile up: more and more
+  // concurrent sockets hitting the host, responses arriving out of order,
+  // and the view falling further and further behind — which is exactly what
+  // "rendering feels slow" turns into over time. This loop can never overlap:
+  // it waits for the response, then waits out whatever's left of the frame
+  // budget (zero, if the request already took longer), before asking again.
   const startCapture = useCallback(() => {
     setIsCapturing(true);
+    capturingRef.current = true;
     fpsCounter.current = 0;
 
     fpsTimer.current = setInterval(() => {
@@ -117,18 +132,25 @@ export default function ClientPage() {
       fpsCounter.current = 0;
     }, 1000);
 
-    // Poll for new frames
-    captureInterval.current = setInterval(async () => {
+    const loop = async () => {
+      if (!capturingRef.current) return;
+      const start = performance.now();
       const data = await window.api?.captureScreen(host.trim(), parseInt(screenPort));
+      if (!capturingRef.current) return; // stopped while the request was in flight
       if (data) {
         setScreenDataUrl(data);
         fpsCounter.current++;
       }
-    }, 200); // ~5fps polling (server is request-response style)
+      const elapsed = performance.now() - start;
+      const delay = Math.max(0, TARGET_FRAME_MS - elapsed);
+      captureTimeoutRef.current = setTimeout(loop, delay);
+    };
+    loop();
   }, [host, screenPort]);
 
   const stopCapture = () => {
-    clearInterval(captureInterval.current);
+    capturingRef.current = false;
+    clearTimeout(captureTimeoutRef.current);
     clearInterval(fpsTimer.current);
     setIsCapturing(false);
   };

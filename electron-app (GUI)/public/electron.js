@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, desktopCapturer, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, desktopCapturer, screen, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -13,6 +13,7 @@ let captureWindow;
 let pythonProc;
 let tray;
 let isQuitting = false; // true only once the user picks "Quit" from the tray
+let serverRunning = false; // true only between a successful start-server and stop-server
 
 // A tiny embedded icon so we don't need an external asset file for the tray.
 const TRAY_ICON_DATA_URL =
@@ -22,17 +23,36 @@ const TRAY_ICON_DATA_URL =
 // toggle whether remote control is allowed. Never sent to remote peers.
 const ADMIN_PORT = 9998;
 
-// Screen-capture quality presets, selectable from Settings. These now only
-// control JPEG compression level — resolution is always native (capture
-// the real pixels as-is; the viewer scales/zooms for display, not the
-// capture pipeline). Downscaling at capture time throws away detail that
-// zooming later can never recover.
+// Screen-capture quality presets, selectable from Settings. Low/Medium/High
+// stay JPEG (smaller frames, good for photos/video-like content) at
+// increasing quality. Ultra switches to PNG — fully LOSSLESS.
+//
+// Why: JPEG's compressor uses chroma subsampling (it throws away color
+// detail around edges to save space). That's invisible on photos but is
+// exactly what makes sharp black-on-white UI text look smeared/fuzzy, no
+// matter how high you push the JPEG quality number — subsampling isn't
+// something the `quality` parameter can turn off. PNG has no such lossy
+// step, so at Ultra, text renders pixel-perfect. Trade-off: PNG frames are
+// noticeably larger, so Ultra is best for reading/coding sessions rather
+// than fast-moving content.
 const QUALITY_PRESETS = {
-  low:    { jpegQuality: 0.5 },
-  medium: { jpegQuality: 0.7 },
-  high:   { jpegQuality: 0.85 },
-  ultra:  { jpegQuality: 0.95 },
+  low:    { format: 'image/jpeg', jpegQuality: 0.5 },
+  medium: { format: 'image/jpeg', jpegQuality: 0.75 },
+  high:   { format: 'image/jpeg', jpegQuality: 0.92 },
+  ultra:  { format: 'image/png' }, // lossless — no chroma subsampling, crisp text
 };
+
+// Bytes arriving over the wire (from our own capture pipeline, or relayed
+// by server.py) can now be either JPEG or PNG depending on the active
+// quality preset. Data URLs need the correct MIME type or the renderer may
+// fail to decode/display the image, so we sniff the real format from the
+// file's magic bytes rather than assuming JPEG.
+function sniffImageMime(buf) {
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return 'image/png';
+  }
+  return 'image/jpeg'; // JPEG SOI is 0xFFD8; also our safe default
+}
 
 // ─── Spawn Python Server ──────────────────────────────────────────────────────
 // Python no longer captures the screen itself — Electron does that (see
@@ -74,6 +94,11 @@ function startPythonServer() {
   pythonProc.on('close', code => {
     console.log('Python exited:', code);
     mainWindow?.webContents.send('server-log', `Python process exited (code ${code})`);
+    // If Python dies on its own (crash, killed externally, etc.) rather than
+    // via our own stop-server flow, reflect that in state so a stale
+    // 'serverRunning = true' doesn't linger and block a future restart.
+    pythonProc = null;
+    serverRunning = false;
   });
   pythonProc.on('error', err => {
     mainWindow?.webContents.send('server-log', '[ERR] Failed to start Python: ' + err.message);
@@ -107,12 +132,62 @@ function createCaptureWindow() {
   captureWindow.on('closed', () => { captureWindow = null; });
 }
 
+// ─── Start / Stop a Host Session ────────────────────────────────────────────
+// Screen capture must only ever run while the user has deliberately chosen
+// to host — never just because the app happens to be open. These two
+// handlers are the single on/off switch: start-server is called when
+// "Host Session" is clicked, stop-server when "Stop Server" is clicked.
+// Both are idempotent, so accidental double-calls are harmless.
+ipcMain.handle('start-server', () => {
+  if (serverRunning) return { ok: true, alreadyRunning: true };
+  startPythonServer();
+  createCaptureWindow();
+  serverRunning = true;
+  return { ok: true };
+});
+
+ipcMain.handle('stop-server', () => {
+  stopServer();
+  return { ok: true };
+});
+
+function stopServer() {
+  // Closing the capture window is what actually stops frames: it tears down
+  // the whole renderer (getUserMedia stream, canvas, the capture loop's
+  // setTimeout chain — everything), so there's no separate "stop capturing"
+  // message needed. Nothing left running means nothing left to send.
+  captureWindow?.close();
+  captureWindow = null;
+  pythonProc?.kill();
+  pythonProc = null;
+  serverRunning = false;
+}
+
 ipcMain.handle('get-primary-screen-source', async () => {
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
     thumbnailSize: { width: 1, height: 1 }, // we only need the id
   });
   return sources[0]?.id ?? null;
+});
+
+// Real, physical pixel resolution of the primary display — used to ask
+// getUserMedia for an EXACT capture size instead of a generic min/max
+// range. Electron's `display.size` is in DIP (logical) pixels, so we
+// multiply by scaleFactor to get actual device pixels on HiDPI/Retina
+// screens (e.g. a 1512x982 @ 2x MacBook is really a 3024x1964 panel).
+// Without this, Chromium's desktop capturer has to pick *some* resolution
+// to satisfy a range constraint that may not match the real screen, and it
+// does that by resampling the video track — which is what was producing
+// soft/blurry frames on machines whose screen size didn't happen to land
+// inside the old hardcoded 1280x720–3840x2160 window.
+ipcMain.handle('get-screen-resolution', () => {
+  const display = screen.getPrimaryDisplay();
+  const scaleFactor = display.scaleFactor || 1;
+  return {
+    width: Math.round(display.size.width * scaleFactor),
+    height: Math.round(display.size.height * scaleFactor),
+  };
 });
 
 // Screen-capture quality (Low/Medium/High), read by the capture window on
@@ -144,7 +219,7 @@ ipcMain.on('frame-captured', (_event, arrayBuffer) => {
   // can show a live local preview. Throttled to ~1 fps to stay cheap.
   frameForwardCounter = (frameForwardCounter + 1) % 5;
   if (frameForwardCounter === 0 && mainWindow) {
-    const dataUrl = 'data:image/jpeg;base64,' + jpegBuffer.toString('base64');
+    const dataUrl = `data:${sniffImageMime(jpegBuffer)};base64,` + jpegBuffer.toString('base64');
     mainWindow.webContents.send('local-preview', dataUrl);
   }
 });
@@ -233,8 +308,10 @@ function createTray() {
 
 // ─── App Lifecycle ────────────────────────────────────────────────────────────
 app.whenReady().then(() => {
-  startPythonServer();
-  createCaptureWindow();
+  // No auto-start here: the Python server + screen capture only spin up
+  // once the user explicitly clicks "Host Session" (see the start-server
+  // handler above). Launching the app should never silently start sharing
+  // your screen.
   createWindow();
   createTray();
 });
@@ -249,8 +326,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
-  pythonProc?.kill();
-  captureWindow?.close();
+  stopServer();
 });
 
 // ─── IPC ──────────────────────────────────────────────────────────────────────
@@ -311,7 +387,7 @@ ipcMain.handle('capture-screen', async (_, host, port) => {
       clearTimeout(timeout);
       if (chunks.length === 0) { resolve(null); return; }
       const buf = Buffer.concat(chunks);
-      resolve('data:image/jpeg;base64,' + buf.toString('base64'));
+      resolve(`data:${sniffImageMime(buf)};base64,` + buf.toString('base64'));
     });
 
     socket.on('error', () => { clearTimeout(timeout); resolve(null); });

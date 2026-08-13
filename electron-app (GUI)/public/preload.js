@@ -14,6 +14,12 @@ contextBridge.exposeInMainWorld('api', {
   // Network
   getNetwork: () => ipcRenderer.invoke('get-network'),
 
+  // Explicit on/off switch for hosting — screen capture only ever runs
+  // between these two calls (see electron.js). start is invoked when
+  // "Host Session" is clicked, stop when "Stop Server" is clicked.
+  startServer: () => ipcRenderer.invoke('start-server'),
+  stopServer:  () => ipcRenderer.invoke('stop-server'),
+
   // Screen capture (single frame via TCP 8080) — used by Client Mode when
   // THIS machine is viewing a remote host.
   captureScreen: (host, port) => ipcRenderer.invoke('capture-screen', host, port),

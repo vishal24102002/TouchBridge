@@ -19,7 +19,7 @@ export default function HomePage() {
         </div>
 
         <div className="mode-grid">
-          <div className="mode-card" onClick={() => setPage('server')}>
+          <div className="mode-card" onClick={async () => { await window.api?.startServer(); setPage('server'); }}>
             <div className="card-icon-wrap">🖥️</div>
             <h3>Host Session</h3>
             <p>

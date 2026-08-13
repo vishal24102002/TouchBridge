@@ -170,7 +170,7 @@ export default function ServerPage() {
         </div>
 
         <div className="mt-auto">
-          <button className="btn btn-danger" onClick={() => setPage('home')}>⬡ Stop Server</button>
+          <button className="btn btn-danger" onClick={async () => { await window.api?.stopServer(); setPage('home'); }}>⬡ Stop Server</button>
         </div>
       </div>
 

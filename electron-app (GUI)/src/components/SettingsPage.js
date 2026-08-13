@@ -120,7 +120,7 @@ export default function SettingsPage() {
                   { key: 'low', label: 'Low', hint: 'more compression · faster' },
                   { key: 'medium', label: 'Medium', hint: 'balanced' },
                   { key: 'high', label: 'High', hint: 'sharp · default' },
-                  { key: 'ultra', label: 'Ultra', hint: 'least compression · sharpest' },
+                  { key: 'ultra', label: 'Ultra', hint: 'lossless PNG · sharpest text' },
                 ].map(opt => (
                   <button
                     key={opt.key}
@@ -134,8 +134,11 @@ export default function SettingsPage() {
                 ))}
               </div>
               <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
-                Resolution is always captured at full native size — this only controls JPEG
-                compression (bandwidth vs. sharpness). Takes effect immediately, even mid-session.
+                Resolution is always captured at full native size — this only controls
+                compression. Low/Medium/High use JPEG (smaller frames, some softening
+                around edges/text). Ultra switches to lossless PNG — no compression
+                artifacts at all, so text stays pixel-sharp, at the cost of larger
+                frames. Takes effect immediately, even mid-session.
               </div>
             </div>
 

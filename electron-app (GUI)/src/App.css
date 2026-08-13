@@ -359,6 +359,7 @@ html, body, #root {
   padding: 20px;
   gap: 16px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .panel-main {
@@ -440,7 +441,7 @@ html, body, #root {
 }
 
 /* ─── Form Elements ───────────────────────────────────────────────────────────── */
-.field { display: flex; flex-direction: column; gap: 5px; }
+.field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .field-label {
   font-size: 9px;
   font-family: var(--font-mono);
@@ -450,6 +451,8 @@ html, body, #root {
 }
 
 .field-input {
+  width: 100%;
+  min-width: 0; /* lets it shrink inside a grid/flex column instead of forcing overflow */
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: var(--r);
@@ -508,6 +511,8 @@ html, body, #root {
 
 /* Select */
 .field-select {
+  width: 100%;
+  min-width: 0;
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: var(--r);
