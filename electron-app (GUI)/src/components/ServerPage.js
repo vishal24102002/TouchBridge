@@ -7,7 +7,7 @@ export default function ServerPage() {
   const [serverStatus, setServerStatus] = useState('starting'); // starting | running | error
   const [copied, setCopied] = useState('');
   const [preview, setPreview] = useState(null); // data URL from the local capture window
-  const [controlAllowed, setControlAllowedState] = useState(true);
+  const [clients, setClients] = useState([]); // connected control-channel devices, pushed live from server.py
   const logRef = useRef(null);
 
   useEffect(() => {
@@ -25,12 +25,18 @@ export default function ServerPage() {
     // Live thumbnail of what's being captured/broadcast right now
     window.api?.onLocalPreview((dataUrl) => setPreview(dataUrl));
 
+    // Live list of devices holding a control-channel connection, pushed
+    // by electron.js whenever server.py reports a change (connect,
+    // disconnect, grant, revoke) — see server.py's ControlSession.
+    window.api?.onControlClientsUpdated((list) => setClients(list || []));
+
     // Assume server is running after a short delay if no error
     const t = setTimeout(() => setServerStatus(s => s === 'starting' ? 'running' : s), 3000);
 
     return () => {
       window.api?.offServerLog?.();
       window.api?.offLocalPreview?.();
+      window.api?.offControlClientsUpdated?.();
       clearTimeout(t);
     };
   }, []);
@@ -39,21 +45,25 @@ export default function ServerPage() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logs]);
 
-  useEffect(() => {
-    // Read the persisted preference to reflect what server.py was actually
-    // launched with (electron.js passes it as --control-allowed at spawn).
-    window.api?.get('controlAllowed').then(v => {
-      if (v !== undefined) setControlAllowedState(v !== false);
-    });
-  }, []);
+  // Grant one connected device exclusive control — server.py automatically
+  // revokes whoever had it before, and the updated list arrives via the
+  // 'control-clients-updated' push, so there's no local state to set here.
+  const grantControlTo = async (clientId) => {
+    await window.api?.grantControl(clientId);
+  };
 
-  const toggleControlAllowed = async () => {
-    const next = !controlAllowed;
-    setControlAllowedState(next); // optimistic
-    const res = await window.api?.setControlAllowed(next);
-    if (!res?.ok) {
-      setControlAllowedState(!next); // revert on failure
-    }
+  // Take control away from whoever currently has it, leaving every
+  // connected device view-only.
+  const revokeControl = async () => {
+    await window.api?.revokeControl();
+  };
+
+  const formatDuration = (connectedAt) => {
+    const secs = Math.max(0, Math.floor(Date.now() / 1000 - connectedAt));
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m`;
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
   };
 
   const copyIP = (ip) => {
@@ -74,7 +84,10 @@ export default function ServerPage() {
       {/* Sidebar */}
       <div className="sidebar">
         <div className="sidebar-header">
-          <button className="back-btn" onClick={() => setPage('home')}>←</button>
+          {/* Back now stops the host session — same effect as "Stop Server" —
+              so leaving this screen never leaves screen sharing running
+              invisibly in the background. */}
+          <button className="back-btn" onClick={async () => { await window.api?.stopServer(); setPage('home'); }}>←</button>
           <div>
             <div className="sidebar-title">Server Mode</div>
             <div className="sidebar-sub">HOSTING</div>
@@ -89,31 +102,72 @@ export default function ServerPage() {
             : 'Starting Server...'}
         </div>
 
-        {/* Remote control permission — gates whether connecting clients can
-            send input at all; server.py enforces this, not just the UI. */}
+        {/* Connected devices — remote control is granted per device, one
+            at a time, instead of a single host-wide switch. A device
+            shows up here as soon as it opens a control connection (i.e.
+            clicks "Enable Control" on its end); granting one automatically
+            revokes whoever had it before — server.py enforces this, not
+            just the UI. */}
         <div className="box">
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div>
-              <div className="box-title" style={{ marginBottom: 2 }}>Allow Remote Control</div>
-              <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>
-                {controlAllowed ? 'Viewers can control this device' : 'View-only — input is blocked'}
-              </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <div className="box-title" style={{ marginBottom: 0 }}>Connected Devices</div>
+            {clients.some(c => c.controlling) && (
+              <button
+                className="btn btn-ghost"
+                style={{ width: 'auto', padding: '3px 10px', fontSize: 10 }}
+                onClick={revokeControl}
+              >
+                Revoke All
+              </button>
+            )}
+          </div>
+
+          {clients.length === 0 && (
+            <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+              No devices connected
             </div>
-            <button
-              onClick={toggleControlAllowed}
-              style={{
-                width: 44, height: 24, borderRadius: 12, border: '1px solid var(--border)',
-                background: controlAllowed ? 'var(--accent)' : 'var(--bg-3)',
-                position: 'relative', cursor: 'pointer', flexShrink: 0, padding: 0,
-              }}
-              title={controlAllowed ? 'Click to disable remote control' : 'Click to enable remote control'}
-            >
-              <span style={{
-                position: 'absolute', top: 2, left: controlAllowed ? 22 : 2,
-                width: 18, height: 18, borderRadius: '50%', background: '#fff',
-                transition: 'left 0.15s ease',
-              }} />
-            </button>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {clients.map(c => (
+              <div
+                key={c.id}
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '8px 10px', background: 'var(--bg-2)', borderRadius: 'var(--r)',
+                  border: `1px solid ${c.controlling ? 'var(--accent)' : 'var(--border)'}`,
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-0)' }}>
+                    {c.addr}
+                  </div>
+                  <div style={{
+                    fontSize: 10, fontFamily: 'var(--font-mono)',
+                    color: c.controlling ? 'var(--accent-2)' : 'var(--text-3)',
+                  }}>
+                    {c.controlling ? '● In control' : 'View only'} · {formatDuration(c.connectedAt)}
+                  </div>
+                </div>
+                {c.controlling ? (
+                  <button
+                    className="btn btn-danger"
+                    style={{ width: 'auto', padding: '5px 12px', fontSize: 11 }}
+                    onClick={revokeControl}
+                  >
+                    Revoke
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-success"
+                    style={{ width: 'auto', padding: '5px 12px', fontSize: 11 }}
+                    onClick={() => grantControlTo(c.id)}
+                  >
+                    Grant
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         </div>
 

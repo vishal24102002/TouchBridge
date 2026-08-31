@@ -61,6 +61,7 @@ export default function ClientPage() {
   const [errorMsg, setErrorMsg] = useState('');
   const [screenDataUrl, setScreenDataUrl] = useState(null);
   const [controlEnabled, setControlEnabled] = useState(false);
+  const [controlPending, setControlPending] = useState(false); // connected, waiting on host to grant
   const [isCapturing, setIsCapturing] = useState(false);
   const [fps, setFps] = useState(0);
   const [typeText, setTypeText] = useState('');
@@ -86,6 +87,23 @@ export default function ClientPage() {
     window.api?.get('lastScreenPort').then(p => { if (p) setScreenPort(p); });
     window.api?.get('lastControlPort').then(p => { if (p) setControlPort(p); });
     return () => stopCapture();
+  }, []);
+
+  // Control is now granted per device by the host, one at a time — it can
+  // change mid-session (host grants someone else, or revokes outright), so
+  // this listens for live pushes rather than assuming whatever the initial
+  // handshake said still holds.
+  useEffect(() => {
+    window.api?.onControlStatus((status) => {
+      setControlPending(false);
+      setControlEnabled(!!status.granted);
+      if (status.disconnected) {
+        setLastCmdStatus('Control connection closed');
+      } else {
+        setLastCmdStatus(status.granted ? 'Control granted by host' : 'Control revoked by host');
+      }
+    });
+    return () => window.api?.offControlStatus?.();
   }, []);
 
   const connect = async () => {
@@ -164,21 +182,40 @@ export default function ClientPage() {
   };
 
   const enableControl = async () => {
+    setControlPending(true);
     const res = await window.api?.controlConnect(host.trim(), parseInt(controlPort));
-    if (res?.ok && res?.allowed) {
-      setControlEnabled(true);
-      setLastCmdStatus('Control connected');
-    } else if (res?.ok && !res?.allowed) {
+
+    if (!res?.ok) {
+      setControlPending(false);
       setControlEnabled(false);
-      setLastCmdStatus('Host has disabled remote control');
-    } else {
       setLastCmdStatus(`Control error: ${res?.error}`);
+      return;
+    }
+    if (res.capable === false) {
+      // Host has no input capability at all (see server.py NOCAP) — no
+      // point staying "pending", there's nothing to wait for.
+      setControlPending(false);
+      setControlEnabled(false);
+      setLastCmdStatus(res.description || 'Host has no input capability');
+      return;
+    }
+    if (res.granted) {
+      setControlPending(false);
+      setControlEnabled(true);
+      setLastCmdStatus('Control granted');
+    } else {
+      // Connected, but the host hasn't granted this device control yet —
+      // stay pending until a 'control-status' push says otherwise.
+      setControlPending(true);
+      setControlEnabled(false);
+      setLastCmdStatus('Connected — waiting for host to grant control');
     }
   };
 
   const disableControl = async () => {
     await window.api?.controlDisconnect();
     setControlEnabled(false);
+    setControlPending(false);
     setLastCmdStatus('Control disconnected');
   };
 
@@ -299,7 +336,7 @@ export default function ClientPage() {
 
         <div className={`status-badge ${controlEnabled ? 'active' : 'connecting'}`}>
           <div className="status-dot" />
-          {controlEnabled ? 'Control Active' : 'View Only'}
+          {controlEnabled ? 'Control Active' : controlPending ? 'Waiting for Host' : 'View Only'}
         </div>
 
         <div className="session-info">
@@ -325,8 +362,8 @@ export default function ClientPage() {
         <div className="box">
           <div className="box-title">Remote Control</div>
           {!controlEnabled ? (
-            <button className="btn btn-success" onClick={enableControl}>
-              🖱 Enable Control
+            <button className="btn btn-success" onClick={enableControl} disabled={controlPending}>
+              {controlPending ? '⏳ Waiting for host...' : '🖱 Enable Control'}
             </button>
           ) : (
             <>

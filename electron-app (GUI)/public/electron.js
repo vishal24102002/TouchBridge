@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, desktopCapturer, screen, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, desktopCapturer, screen, Tray, Menu, nativeImage, dialog } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -7,6 +7,18 @@ const Store = require('electron-store');
 
 const store = new Store();
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+
+// Must come before any other app.commandLine/app setup — Chromium's GPU
+// compositor is a common source of a solid black window on Linux (bad
+// driver/Wayland/XWayland combos), where the app launches fine but never
+// paints past the BrowserWindow's backgroundColor. Disabling hardware
+// acceleration trades off some rendering perf for reliably painting content.
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-gpu-compositing');
+app.commandLine.appendSwitch('disable-software-rasterizer');
+
+app.commandLine.appendSwitch("no-sandbox");
 
 let mainWindow;
 let captureWindow;
@@ -71,20 +83,44 @@ function startPythonServer() {
   }
 
   const bin = process.platform === 'win32' ? 'python' : 'python3';
-  const controlAllowed = store.get('controlAllowed', true); // persisted host preference
   const args = [
     script,
     '--admin-port', String(ADMIN_PORT),
-    '--control-allowed', controlAllowed ? 'true' : 'false',
   ];
   // stdio defaults to ['pipe','pipe','pipe'], so pythonProc.stdin is
   // writable — that's how captured frames get delivered.
   pythonProc = spawn(bin, args, { cwd: serverDir });
 
+  // Remote control is now granted per connected device rather than a
+  // single host-wide switch (see server.py's ControlSession). Whenever
+  // that list changes, server.py prints one line prefixed with
+  // CLIENTS_MARKER containing the JSON list — we watch stdout for that
+  // prefix and forward it to the renderer as structured data instead of
+  // a plain log line, so ServerPage.js's device list updates live with
+  // no polling.
+  const CLIENTS_MARKER = '__TB_CLIENTS__';
+  let stdoutBuffer = '';
   pythonProc.stdout.on('data', d => {
-    const msg = d.toString().trim();
-    console.log('[PY]', msg);
-    mainWindow?.webContents.send('server-log', msg);
+    stdoutBuffer += d.toString();
+    let newlineIndex;
+    while ((newlineIndex = stdoutBuffer.indexOf('\n')) !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, '');
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (!line) continue;
+
+      if (line.startsWith(CLIENTS_MARKER)) {
+        try {
+          const clients = JSON.parse(line.slice(CLIENTS_MARKER.length));
+          mainWindow?.webContents.send('control-clients-updated', clients);
+        } catch (e) {
+          console.warn('[PY] failed to parse client list:', e.message);
+        }
+        continue;
+      }
+
+      console.log('[PY]', line);
+      mainWindow?.webContents.send('server-log', line);
+    }
   });
   pythonProc.stderr.on('data', d => {
     const msg = d.toString().trim();
@@ -99,6 +135,9 @@ function startPythonServer() {
     // 'serverRunning = true' doesn't linger and block a future restart.
     pythonProc = null;
     serverRunning = false;
+    // No process, no connected control clients — clear the device list
+    // rather than leaving ServerPage.js showing stale entries.
+    mainWindow?.webContents.send('control-clients-updated', []);
   });
   pythonProc.on('error', err => {
     mainWindow?.webContents.send('server-log', '[ERR] Failed to start Python: ' + err.message);
@@ -255,18 +294,54 @@ function createWindow() {
   const url = isDev
     ? 'http://localhost:3000'
     : `file://${path.join(__dirname, '../build/index.html')}`;
-  mainWindow.loadURL(url);
+
+  // TEMP DIAGNOSTIC: surfaces load failures (bad path, missing asset, etc.)
+  // instead of failing silently and leaving a blank backgroundColor window.
+  // Remove the .catch() and the forced openDevTools() call below once the
+  // black-screen issue is confirmed fixed.
+  mainWindow.loadURL(url).catch(err => {
+    console.error('[loadURL] failed to load app:', err);
+    mainWindow?.webContents.send('server-log', '[ERR] Failed to load UI: ' + err.message);
+  });
 
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  // TEMP: force DevTools open in production too, to inspect console errors
+  // on a packaged build. Remove this line once debugging is done.
+  else mainWindow.webContents.openDevTools({ mode: 'detach' });
 
-  // Closing the window (✕ button) hides it instead of quitting — screen
-  // sharing (capture window + Python relay) keeps running in the
-  // background, reachable again via the tray icon. Only "Quit" from the
-  // tray menu actually exits the app.
+  // Closing the window (✕ button): if nothing is being shared, just hide
+  // (same as before). If a host session IS active, don't silently decide
+  // for the user — ask whether to stop sharing or keep broadcasting in the
+  // background. "Quit" from the tray menu still bypasses this entirely via
+  // isQuitting.
   mainWindow.on('close', (event) => {
     if (isQuitting) return;
     event.preventDefault();
-    mainWindow.hide();
+
+    if (!serverRunning) {
+      mainWindow.hide();
+      return;
+    }
+
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'question',
+      buttons: ['Stop Sharing && Close', 'Keep Sharing in Background', 'Cancel'],
+      defaultId: 1,
+      cancelId: 2,
+      title: 'Screen Sharing Active',
+      message: 'You are currently sharing your screen.',
+      detail: 'Stop the session before closing, or keep broadcasting in the background (reachable again from the tray icon).',
+    });
+
+    if (choice === 0) {
+      // Stop Sharing & Close
+      stopServer();
+      mainWindow.hide();
+    } else if (choice === 1) {
+      // Keep Sharing in Background — previous default behavior
+      mainWindow.hide();
+    }
+    // choice === 2 (Cancel) — do nothing, window stays open
   });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
@@ -396,11 +471,21 @@ ipcMain.handle('capture-screen', async (_, host, port) => {
 });
 
 // ─── TCP Control Bridge ────────────────────────────────────────────────────
-// server.py now sends a handshake line right after connect — "ALLOWED\n" or
-// "DENIED\n" — reflecting whether the HOST currently permits remote control.
-// We read that line before resolving so the renderer knows immediately,
-// instead of assuming control works and finding out only when a command
-// silently does nothing.
+// Control is granted per connected device now (see server.py's
+// ControlSession), not by a single host-wide allow/deny flag. On connect,
+// server.py sends:
+//   NOCAP:<description>\n                          — host has no input
+//                                                      capability at all;
+//                                                      connection closes
+//   INFO:<id>:<tier>:<display>:<description>\n      — this device's id +
+//                                                      the host's capability
+//   STATUS:GRANTED\n | STATUS:VIEW_ONLY\n           — current grant state
+// ...and later, any time the host grants/revokes this specific device's
+// control, another STATUS line arrives asynchronously — not just once at
+// connect time. We resolve the initial promise once INFO + the first
+// STATUS line have both arrived, and forward every STATUS line after that
+// to the renderer as a 'control-status' push so ClientPage.js can react
+// live (e.g. the host grants someone else, revoking this device mid-session).
 let controlSocket = null;
 
 ipcMain.handle('control-connect', async (_, host, port) => {
@@ -408,36 +493,67 @@ ipcMain.handle('control-connect', async (_, host, port) => {
     if (controlSocket) { controlSocket.destroy(); controlSocket = null; }
     const net = require('net');
     controlSocket = new net.Socket();
-    let handshakeDone = false;
     let buf = '';
+    let infoReceived = false;
+    let settled = false;
 
     controlSocket.connect(port || 9999, host || '127.0.0.1', () => {
-      // wait for the handshake line before resolving
+      // wait for INFO + STATUS before resolving
     });
 
     controlSocket.on('data', (chunk) => {
-      if (handshakeDone) return; // subsequent data isn't part of the handshake
       buf += chunk.toString('utf8');
-      const newlineIndex = buf.indexOf('\n');
-      if (newlineIndex === -1) return;
-      const line = buf.slice(0, newlineIndex).trim();
-      handshakeDone = true;
-      if (line === 'ALLOWED') {
-        resolve({ ok: true, allowed: true });
-      } else if (line === 'DENIED') {
-        resolve({ ok: true, allowed: false });
-        controlSocket?.destroy();
-        controlSocket = null;
-      } else {
-        resolve({ ok: false, error: `Unexpected handshake: ${line}` });
+      let newlineIndex;
+      while ((newlineIndex = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, newlineIndex).trim();
+        buf = buf.slice(newlineIndex + 1);
+        if (!line) continue;
+
+        if (line.startsWith('NOCAP:')) {
+          if (!settled) {
+            settled = true;
+            resolve({ ok: true, capable: false, description: line.slice('NOCAP:'.length) });
+          }
+          controlSocket?.destroy();
+          controlSocket = null;
+          return;
+        }
+
+        if (line.startsWith('INFO:')) {
+          const [idStr, tier, display, ...rest] = line.slice('INFO:'.length).split(':');
+          mainWindow?.webContents.send('control-info', {
+            id: Number(idStr),
+            tier,
+            display,
+            description: rest.join(':'),
+          });
+          infoReceived = true;
+          continue;
+        }
+
+        if (line.startsWith('STATUS:')) {
+          const status = line.slice('STATUS:'.length); // GRANTED | VIEW_ONLY | REVOKED
+          const granted = status === 'GRANTED';
+          if (!settled && infoReceived) {
+            settled = true;
+            resolve({ ok: true, capable: true, granted });
+          } else if (settled) {
+            // A later grant/revoke pushed mid-session — not the initial handshake.
+            mainWindow?.webContents.send('control-status', { granted });
+          }
+          continue;
+        }
       }
     });
 
     controlSocket.on('error', (e) => {
       controlSocket = null;
-      if (!handshakeDone) resolve({ ok: false, error: e.message });
+      if (!settled) { settled = true; resolve({ ok: false, error: e.message }); }
     });
-    controlSocket.on('close', () => { controlSocket = null; });
+    controlSocket.on('close', () => {
+      controlSocket = null;
+      if (settled) mainWindow?.webContents.send('control-status', { granted: false, disconnected: true });
+    });
   });
 });
 
@@ -450,24 +566,45 @@ ipcMain.handle('control-send', async (_, cmd) => {
   });
 });
 
-// Toggles whether THIS machine (as a host) accepts remote-control commands.
-// Talks to server.py's loopback-only admin port — never reachable remotely.
-ipcMain.handle('set-control-allowed', async (_, allowed) => {
-  store.set('controlAllowed', !!allowed); // persist so the next launch remembers it
+// Sends a single command to server.py's loopback-only admin port and
+// resolves with the first line of its response. Never reachable remotely
+// — this is strictly the local host UI talking to its own Python process.
+function adminRequest(command) {
   return new Promise((resolve) => {
     const net = require('net');
     const socket = new net.Socket();
+    let buf = '';
     socket.setTimeout(3000);
     socket.connect(ADMIN_PORT, '127.0.0.1', () => {
-      socket.write(allowed ? 'allow' : 'deny');
+      socket.write(command);
     });
     socket.on('data', (data) => {
-      resolve({ ok: data.toString().trim() === 'OK' });
-      socket.destroy();
+      buf += data.toString();
+      if (buf.includes('\n')) {
+        socket.destroy();
+        resolve(buf.slice(0, buf.indexOf('\n')));
+      }
     });
-    socket.on('error', (e) => resolve({ ok: false, error: e.message }));
-    socket.on('timeout', () => { socket.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    socket.on('error', (e) => resolve(null));
+    socket.on('timeout', () => { socket.destroy(); resolve(null); });
   });
+}
+
+// Grants ONE connected device (by its server.py-assigned client id)
+// exclusive remote control, automatically revoking anyone who had it
+// before — see server.py's ControlSession.grant(). The live device list
+// (with the new "controlling" flag) arrives separately via the
+// 'control-clients-updated' push, not as this call's return value.
+ipcMain.handle('grant-control', async (_, clientId) => {
+  const res = await adminRequest(`grant:${clientId}`);
+  return { ok: res === 'OK', error: res && res.startsWith('ERR') ? res : undefined };
+});
+
+// Takes control away from whoever currently has it, leaving every
+// connected device view-only until the host grants someone again.
+ipcMain.handle('revoke-control', async () => {
+  const res = await adminRequest('revoke');
+  return { ok: res === 'OK' };
 });
 
 ipcMain.handle('control-disconnect', async () => {

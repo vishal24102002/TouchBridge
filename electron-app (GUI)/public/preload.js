@@ -29,11 +29,29 @@ contextBridge.exposeInMainWorld('api', {
   controlSend:       (cmd)        => ipcRenderer.invoke('control-send', cmd),
   controlDisconnect: ()           => ipcRenderer.invoke('control-disconnect'),
 
-  // Host-side toggle: whether THIS machine currently accepts remote-control
-  // commands when someone connects to it in Server Mode.
-  setControlAllowed: (allowed) => ipcRenderer.invoke('set-control-allowed', allowed),
+  // Live push while a control socket is open: fires whenever the host
+  // grants/revokes control for THIS connection (see server.py's
+  // STATUS:GRANTED / STATUS:REVOKED messages), so ClientPage.js can react
+  // immediately instead of polling.
+  onControlStatus:  (cb) => ipcRenderer.on('control-status', (_, status) => cb(status)),
+  offControlStatus: ()   => ipcRenderer.removeAllListeners('control-status'),
 
-  // Screen-capture quality: 'low' | 'medium' | 'high'.
+  // Host-side: remote control is now granted per connected device rather
+  // than a single blanket on/off switch. grantControl(id) gives that one
+  // device exclusive control (server.py automatically revokes whoever had
+  // it before); revokeControl() takes control away from everyone, leaving
+  // all connected devices view-only.
+  grantControl:  (clientId) => ipcRenderer.invoke('grant-control', clientId),
+  revokeControl: ()         => ipcRenderer.invoke('revoke-control'),
+
+  // Host-side: live list of devices currently holding a control-channel
+  // connection (id, address, connected_at, whether they currently hold
+  // the grant). Pushed by electron.js whenever server.py reports a change
+  // — no polling needed.
+  onControlClientsUpdated:  (cb) => ipcRenderer.on('control-clients-updated', (_, clients) => cb(clients)),
+  offControlClientsUpdated: ()   => ipcRenderer.removeAllListeners('control-clients-updated'),
+
+  // Screen-capture quality: 'low' | 'medium' | 'high' | 'ultra'.
   setCaptureQuality: (quality) => ipcRenderer.invoke('set-capture-quality', quality),
 
   // Server logs
