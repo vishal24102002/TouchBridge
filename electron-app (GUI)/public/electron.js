@@ -3,6 +3,9 @@ const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
+const tls = require('tls');
+const dgram = require('dgram');
+const crypto = require('crypto');
 const Store = require('electron-store');
 
 const store = new Store();
@@ -34,6 +37,180 @@ const TRAY_ICON_DATA_URL =
 // Loopback-only admin port server.py exposes for the local host UI to
 // toggle whether remote control is allowed. Never sent to remote peers.
 const ADMIN_PORT = 9998;
+
+// Chat file attachments travel as base64 over the same text-line control/
+// admin channels as chat itself (see server.py) rather than a separate
+// binary transfer protocol — keeping this small keeps that practical.
+// Mirrors server.py's MAX_FILE_BYTES; keep the two in sync.
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+
+// Per-user directory for server.py's persisted device ID, password, and
+// TLS cert/key — survives reinstalls of the app itself, and is a real
+// writable location regardless of how TouchBridge was packaged/installed.
+const SERVER_CONFIG_DIR = path.join(app.getPath('userData'), 'server-config');
+
+// device.json lives here — same path server.py's security.DeviceIdentity
+// reads/writes (we always pass --config-dir SERVER_CONFIG_DIR when
+// spawning it, see startPythonServer below), so whichever side touches
+// this file first "wins" and the other just loads what's there.
+//
+// Reading/creating it straight from Electron (instead of always round-
+// tripping through Python's admin port) means the Device ID and password
+// are available immediately — even before a host session has ever been
+// started — rather than showing blank/"(starting…)" until the Python
+// process finishes booting.
+const DEVICE_IDENTITY_PATH = path.join(SERVER_CONFIG_DIR, 'device.json');
+const PASSWORD_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+function generatePassword(length = 6) {
+  return Array.from({ length }, () => PASSWORD_ALPHABET[crypto.randomInt(PASSWORD_ALPHABET.length)]).join('');
+}
+
+// Loads the persisted { id, password } if it exists and is well-formed;
+// otherwise generates one (9-digit id, 6-char password — matching
+// security.DeviceIdentity's format exactly) and persists it. This only
+// ever creates the identity once — every later call just reads the same
+// file back, on either side of the Electron/Python boundary.
+function loadOrCreateDeviceIdentity() {
+  try {
+    const data = JSON.parse(fs.readFileSync(DEVICE_IDENTITY_PATH, 'utf8'));
+    if (data && data.id && data.password) return data;
+  } catch (e) {
+    // missing or corrupt — fall through and (re)create it
+  }
+  const id = Array.from({ length: 9 }, () => crypto.randomInt(10)).join('');
+  const data = { id, password: generatePassword() };
+  fs.mkdirSync(SERVER_CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(DEVICE_IDENTITY_PATH, JSON.stringify(data));
+  return data;
+}
+
+// UDP port server.py's LAN discovery responder listens on. "Connect by
+// ID" resolves a 9-digit Device ID to an IP by broadcasting a query on
+// this port and collecting the reply — only works within the same LAN
+// broadcast domain, there's no internet-wide directory behind this.
+const DISCOVERY_PORT = 47821;
+const DISCOVERY_MAGIC = 'TOUCHBRIDGE_DISCOVER';
+
+// ─── TLS trust-on-first-use fingerprint pinning ───────────────────────────
+// server.py's certificate is self-signed (see security.py) — there's no
+// CA to vouch for it, so on its own TLS here only guarantees the traffic
+// is encrypted, not who's on the other end. We close that gap the same
+// way SSH does: remember the certificate fingerprint the first time we
+// successfully connect to a given host, and refuse to proceed silently if
+// a LATER connection to that same host presents a different one — that
+// mismatch is exactly what a man-in-the-middle after the first connection
+// would look like.
+function checkPinnedFingerprint(host, socket) {
+  const cert = socket.getPeerCertificate();
+  if (!cert || !cert.fingerprint256) {
+    return { ok: false, reason: 'no_certificate' };
+  }
+  const key = `tlsFingerprint:${host}`;
+  const known = store.get(key);
+  if (!known) {
+    store.set(key, cert.fingerprint256);
+    return { ok: true, firstSeen: true };
+  }
+  if (known !== cert.fingerprint256) {
+    return { ok: false, reason: 'fingerprint_mismatch' };
+  }
+  return { ok: true, firstSeen: false };
+}
+
+// Opens a TLS connection to a TouchBridge host and applies fingerprint
+// pinning before resolving. rejectUnauthorized is false because the cert
+// is self-signed by design (see security.py) — checkPinnedFingerprint is
+// what actually protects the connection, not Node's built-in CA trust.
+function connectSecure(host, port, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({ host, port, rejectUnauthorized: false }, () => {
+      const check = checkPinnedFingerprint(host, socket);
+      if (!check.ok) {
+        socket.destroy();
+        if (check.reason === 'fingerprint_mismatch') {
+          reject(new Error(
+            `Security warning: ${host}'s certificate has changed since the last time you connected — this could mean the host was reinstalled, or that someone is impersonating it. Refusing to connect.`
+          ));
+        } else {
+          reject(new Error(`Could not verify ${host}'s certificate.`));
+        }
+        return;
+      }
+      // The timeout below exists only to bound how long we wait for the
+      // TLS handshake — it must NOT keep running after that. socket.setTimeout
+      // is an idle timer: it fires (and destroys the socket) after ANY
+      // stretch of inactivity, not just during connection setup. Long-lived
+      // callers — most importantly the control channel, which also carries
+      // chat and can legitimately sit idle for a while between commands or
+      // messages — were getting silently killed the next time that gap
+      // exceeded timeoutMs, which is exactly what looked like a random
+      // disconnect a few minutes into a session, and left the socket
+      // 'destroyed' so the next chat send failed with "Not connected".
+      // Disarming it here (0 = no timeout) once we're actually connected
+      // fixes that; short-lived callers already close their own socket
+      // right after use, so this doesn't change their behavior.
+      socket.setTimeout(0);
+      resolve(socket);
+    });
+    socket.setTimeout(timeoutMs, () => { socket.destroy(); reject(new Error('Connection timed out')); });
+    socket.on('error', (e) => reject(e));
+  });
+}
+
+// Decodes and writes to disk a file attachment that just arrived over
+// chat (from server.py's FILE:/CHAT_MARKER file payloads — see below),
+// and returns what the renderer needs to show it. Shared by both the
+// host-side (pythonProc stdout) and client-side (control socket) message
+// paths, since both receive the same base64 name/content shape.
+function saveReceivedFile(fileNameB64, fileDataB64) {
+  try {
+    // path.basename strips any directory components a malicious/broken
+    // peer might smuggle into the filename, so this can never write
+    // outside receivedDir.
+    const rawName = Buffer.from(fileNameB64, 'base64').toString('utf8');
+    const safeName = path.basename(rawName) || 'received_file';
+    const receivedDir = path.join(app.getPath('downloads'), 'TouchBridge');
+    fs.mkdirSync(receivedDir, { recursive: true });
+
+    let destName = safeName;
+    let n = 1;
+    while (fs.existsSync(path.join(receivedDir, destName))) {
+      const ext = path.extname(safeName);
+      const base = path.basename(safeName, ext);
+      destName = `${base} (${n})${ext}`;
+      n++;
+    }
+
+    const destPath = path.join(receivedDir, destName);
+    fs.writeFileSync(destPath, Buffer.from(fileDataB64, 'base64'));
+    return { fileName: destName, savedPath: destPath };
+  } catch (e) {
+    console.warn('Failed to save received chat file:', e.message);
+    return null;
+  }
+}
+
+// Opens a native file picker, reads the chosen file, and formats it as a
+// 'file:<name_b64>:<data_b64>' command ready to hand to either adminRequest
+// (host sending) or controlSocket.write (client sending) — both send sides
+// share this instead of duplicating the pick/read/encode/size-check steps.
+async function pickAndReadFileForChat() {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Select a file to send',
+    properties: ['openFile'],
+  });
+  if (result.canceled || !result.filePaths?.[0]) return { canceled: true };
+  const filePath = result.filePaths[0];
+  const stat = fs.statSync(filePath);
+  if (stat.size > MAX_FILE_BYTES) {
+    return { canceled: false, error: `File too large — max ${Math.floor(MAX_FILE_BYTES / (1024 * 1024))} MB` };
+  }
+  const fileName = path.basename(filePath);
+  const data = fs.readFileSync(filePath);
+  const cmd = `file:${Buffer.from(fileName).toString('base64')}:${data.toString('base64')}`;
+  return { canceled: false, fileName, cmd };
+}
 
 // Screen-capture quality presets, selectable from Settings. Low/Medium/High
 // stay JPEG (smaller frames, good for photos/video-like content) at
@@ -86,19 +263,29 @@ function startPythonServer() {
   const args = [
     script,
     '--admin-port', String(ADMIN_PORT),
+    '--config-dir', SERVER_CONFIG_DIR,
   ];
+  // Settings page default (persisted; see get-chat-default/set-chat-default
+  // below) — only needs passing when chat should start OFF, since the
+  // server's own default is already "on".
+  if (store.get('chatEnabledDefault', true) === false) {
+    args.push('--chat-disabled');
+  }
   // stdio defaults to ['pipe','pipe','pipe'], so pythonProc.stdin is
   // writable — that's how captured frames get delivered.
   pythonProc = spawn(bin, args, { cwd: serverDir });
 
-  // Remote control is now granted per connected device rather than a
-  // single host-wide switch (see server.py's ControlSession). Whenever
-  // that list changes, server.py prints one line prefixed with
-  // CLIENTS_MARKER containing the JSON list — we watch stdout for that
-  // prefix and forward it to the renderer as structured data instead of
-  // a plain log line, so ServerPage.js's device list updates live with
+  // Remote control is granted per connected device (see server.py's
+  // ControlSession), and every connection now also has to pass password +
+  // host-acceptance pairing (see security.PairingManager). Both of those
+  // change over time, so server.py prints a marker-prefixed JSON line on
+  // stdout whenever either list changes — we watch stdout for those
+  // prefixes and forward the parsed JSON to the renderer as structured
+  // pushes instead of plain log lines, so the host UI updates live with
   // no polling.
   const CLIENTS_MARKER = '__TB_CLIENTS__';
+  const PENDING_MARKER = '__TB_PENDING__';
+  const CHAT_MARKER = '__TB_CHAT__';
   let stdoutBuffer = '';
   pythonProc.stdout.on('data', d => {
     stdoutBuffer += d.toString();
@@ -114,6 +301,38 @@ function startPythonServer() {
           mainWindow?.webContents.send('control-clients-updated', clients);
         } catch (e) {
           console.warn('[PY] failed to parse client list:', e.message);
+        }
+        continue;
+      }
+
+      if (line.startsWith(PENDING_MARKER)) {
+        try {
+          const pending = JSON.parse(line.slice(PENDING_MARKER.length));
+          mainWindow?.webContents.send('pending-requests-updated', pending);
+        } catch (e) {
+          console.warn('[PY] failed to parse pending requests:', e.message);
+        }
+        continue;
+      }
+
+      if (line.startsWith(CHAT_MARKER)) {
+        // A remote device sent a chat message (text or file) — server.py
+        // already broadcast it to every other connected control client;
+        // this is just how the HOST's own UI (ServerPage.js) finds out
+        // about it.
+        try {
+          const msg = JSON.parse(line.slice(CHAT_MARKER.length));
+          if (msg.fileNameB64) {
+            const saved = saveReceivedFile(msg.fileNameB64, msg.fileDataB64);
+            mainWindow?.webContents.send('chat-message', {
+              from: msg.from, time: msg.time, source: msg.source,
+              fileName: saved?.fileName || '(file)', savedPath: saved?.savedPath,
+            });
+          } else {
+            mainWindow?.webContents.send('chat-message', msg);
+          }
+        } catch (e) {
+          console.warn('[PY] failed to parse chat message:', e.message);
         }
         continue;
       }
@@ -135,9 +354,10 @@ function startPythonServer() {
     // 'serverRunning = true' doesn't linger and block a future restart.
     pythonProc = null;
     serverRunning = false;
-    // No process, no connected control clients — clear the device list
-    // rather than leaving ServerPage.js showing stale entries.
+    // No process, no connected control clients or pending pairing
+    // requests — clear both rather than leaving the UI showing stale entries.
     mainWindow?.webContents.send('control-clients-updated', []);
+    mainWindow?.webContents.send('pending-requests-updated', []);
   });
   pythonProc.on('error', err => {
     mainWindow?.webContents.send('server-log', '[ERR] Failed to start Python: ' + err.message);
@@ -309,19 +529,22 @@ function createWindow() {
   // on a packaged build. Remove this line once debugging is done.
   else mainWindow.webContents.openDevTools({ mode: 'detach' });
 
-  // Closing the window (✕ button): if nothing is being shared, just hide
-  // (same as before). If a host session IS active, don't silently decide
-  // for the user — ask whether to stop sharing or keep broadcasting in the
-  // background. "Quit" from the tray menu still bypasses this entirely via
-  // isQuitting.
+  // Closing the window (✕ button): if nothing is being shared, quit
+  // outright — there's no session running in the background worth
+  // keeping the process alive for. If a host session IS active, don't
+  // silently decide for the user — ask whether to stop sharing or keep
+  // broadcasting in the background. "Quit" from the tray menu still
+  // bypasses this entirely via isQuitting.
   mainWindow.on('close', (event) => {
     if (isQuitting) return;
-    event.preventDefault();
 
     if (!serverRunning) {
-      mainWindow.hide();
+      isQuitting = true;
+      app.quit();
       return;
     }
+
+    event.preventDefault();
 
     const choice = dialog.showMessageBoxSync(mainWindow, {
       type: 'question',
@@ -334,9 +557,10 @@ function createWindow() {
     });
 
     if (choice === 0) {
-      // Stop Sharing & Close
+      // Stop Sharing & Close — nothing left running, so actually quit
       stopServer();
-      mainWindow.hide();
+      isQuitting = true;
+      app.quit();
     } else if (choice === 1) {
       // Keep Sharing in Background — previous default behavior
       mainWindow.hide();
@@ -395,8 +619,20 @@ app.whenReady().then(() => {
 // screen-sharing session) alive. This intentionally overrides Electron's
 // usual "quit when all windows are closed" default on every platform, not
 // just macOS, since the whole point here is background operation.
+//
+// "Keep Sharing in Background" hides the window rather than closing it
+// (mainWindow.hide(), not .close()), so it never actually reaches zero
+// windows / this handler. The only way we get here is via an intentional
+// quit path (Quit from the tray, or closing when nothing is running) —
+// every one of those already sets isQuitting and calls app.quit() before
+// the window is allowed to actually close. But adding this listener at
+// all overrides Electron's own default behavior of finishing the quit
+// once the last window closes, so without an explicit app.exit() here
+// the process would just sit there — no windows, but still alive on the
+// tray, since window-all-closed doing nothing quietly cancels the quit
+// that was already in progress.
 app.on('window-all-closed', () => {
-  // no-op — stay alive via the tray
+  app.exit();
 });
 
 app.on('before-quit', () => {
@@ -435,71 +671,78 @@ ipcMain.handle('get-network', () => {
   return result;
 });
 
-// ─── TCP Screen Capture Bridge (unchanged) ────────────────────────────────────
-// Still used by ClientPage.js when THIS machine acts as a viewer connecting
-// to a remote TouchBridge host — that remote host's Python server responds
-// to "capture\n" with a single JPEG per connection, exactly as before.
-ipcMain.handle('capture-screen', async (_, host, port) => {
+// ─── TCP Screen Capture Bridge ─────────────────────────────────────────────
+// Used by ClientPage.js when THIS machine acts as a viewer connecting to a
+// remote TouchBridge host. The connection is now TLS (fingerprint-pinned)
+// and every request must carry the session token issued by pair-connect —
+// without one, the host sends nothing back at all.
+ipcMain.handle('capture-screen', async (_, host, port, token) => {
+  let socket;
+  try {
+    socket = await connectSecure(host, port || 8080, 20000);
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+
   return new Promise((resolve) => {
-    const socket = new (require('net').Socket)();
     const chunks = [];
     let timeout;
 
-    socket.setTimeout(20000); // idle timeout — resets on any data received
-    socket.connect(port || 8080, host || '127.0.0.1', () => {
-      socket.write('capture\n');
-      // Hard cap on total wait time — native-resolution frames are no
-      // longer downscaled, so this needs real headroom on slower links.
-      timeout = setTimeout(() => {
-        socket.destroy();
-        resolve(null);
-      }, 20000);
-    });
+    socket.write(`capture:${token || ''}\n`);
+    // Hard cap on total wait time — native-resolution frames are no
+    // longer downscaled, so this needs real headroom on slower links.
+    timeout = setTimeout(() => {
+      socket.destroy();
+      resolve({ ok: false, error: 'timeout' });
+    }, 20000);
 
     socket.on('data', chunk => chunks.push(chunk));
 
     socket.on('end', () => {
       clearTimeout(timeout);
-      if (chunks.length === 0) { resolve(null); return; }
+      if (chunks.length === 0) { resolve({ ok: false, error: 'no_data' }); return; }
       const buf = Buffer.concat(chunks);
-      resolve(`data:${sniffImageMime(buf)};base64,` + buf.toString('base64'));
+      resolve({ ok: true, dataUrl: `data:${sniffImageMime(buf)};base64,` + buf.toString('base64') });
     });
 
-    socket.on('error', () => { clearTimeout(timeout); resolve(null); });
-    socket.on('timeout', () => { socket.destroy(); resolve(null); });
+    socket.on('error', (e) => { clearTimeout(timeout); resolve({ ok: false, error: e.message }); });
+    socket.on('timeout', () => { socket.destroy(); resolve({ ok: false, error: 'timeout' }); });
   });
 });
 
 // ─── TCP Control Bridge ────────────────────────────────────────────────────
-// Control is granted per connected device now (see server.py's
-// ControlSession), not by a single host-wide allow/deny flag. On connect,
-// server.py sends:
-//   NOCAP:<description>\n                          — host has no input
-//                                                      capability at all;
-//                                                      connection closes
-//   INFO:<id>:<tier>:<display>:<description>\n      — this device's id +
-//                                                      the host's capability
-//   STATUS:GRANTED\n | STATUS:VIEW_ONLY\n           — current grant state
+// Control is granted per connected device (see server.py's ControlSession),
+// and every control connection must now authenticate with a session token
+// (issued by pair-connect) as the very first line before server.py sends
+// anything back:
+//   [client sends]  AUTH:<token>\n
+//   AUTH_FAILED:<reason>\n                            — bad/expired token
+//   NOCAP:<description>\n                             — host has no input
+//                                                        capability at all
+//   INFO:<id>:<tier>:<display>:<description>\n        — this device's id +
+//                                                        the host's capability
+//   STATUS:GRANTED\n | STATUS:VIEW_ONLY\n             — current grant state
 // ...and later, any time the host grants/revokes this specific device's
-// control, another STATUS line arrives asynchronously — not just once at
-// connect time. We resolve the initial promise once INFO + the first
-// STATUS line have both arrived, and forward every STATUS line after that
-// to the renderer as a 'control-status' push so ClientPage.js can react
-// live (e.g. the host grants someone else, revoking this device mid-session).
+// control, another STATUS line arrives asynchronously. We resolve the
+// initial promise once INFO + the first STATUS line have both arrived, and
+// forward every STATUS line after that to the renderer as a 'control-status'
+// push so ClientPage.js can react live.
 let controlSocket = null;
 
-ipcMain.handle('control-connect', async (_, host, port) => {
+ipcMain.handle('control-connect', async (_, host, port, token) => {
+  let socket;
+  try {
+    socket = await connectSecure(host, port || 9999, 8000);
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+  controlSocket = socket;
+  controlSocket.write(`AUTH:${token || ''}\n`);
+
   return new Promise((resolve) => {
-    if (controlSocket) { controlSocket.destroy(); controlSocket = null; }
-    const net = require('net');
-    controlSocket = new net.Socket();
     let buf = '';
     let infoReceived = false;
     let settled = false;
-
-    controlSocket.connect(port || 9999, host || '127.0.0.1', () => {
-      // wait for INFO + STATUS before resolving
-    });
 
     controlSocket.on('data', (chunk) => {
       buf += chunk.toString('utf8');
@@ -509,14 +752,25 @@ ipcMain.handle('control-connect', async (_, host, port) => {
         buf = buf.slice(newlineIndex + 1);
         if (!line) continue;
 
+        if (line.startsWith('AUTH_FAILED:')) {
+          if (!settled) { settled = true; resolve({ ok: false, error: line.slice('AUTH_FAILED:'.length) }); }
+          controlSocket?.destroy();
+          controlSocket = null;
+          return;
+        }
+
         if (line.startsWith('NOCAP:')) {
+          // No input capability on the host — resolve so the UI can show
+          // that, but do NOT tear down the socket. Chat rides this same
+          // control channel and isn't gated by input capability (see
+          // server.py); the connection stays open so the CHAT_STATE line
+          // right behind this one (and any CHAT:/CHAT_ERROR: later) still
+          // reaches the renderer instead of being lost with the socket.
           if (!settled) {
             settled = true;
             resolve({ ok: true, capable: false, description: line.slice('NOCAP:'.length) });
           }
-          controlSocket?.destroy();
-          controlSocket = null;
-          return;
+          continue;
         }
 
         if (line.startsWith('INFO:')) {
@@ -543,6 +797,41 @@ ipcMain.handle('control-connect', async (_, host, port) => {
           }
           continue;
         }
+
+        if (line.startsWith('CHAT_STATE:')) {
+          // Whether the host currently has chat turned on — pushed once
+          // right after connecting, and again any time the host flips it.
+          const enabled = line.slice('CHAT_STATE:'.length) === 'on';
+          mainWindow?.webContents.send('chat-state', { enabled });
+          continue;
+        }
+
+        if (line.startsWith('CHAT:')) {
+          // A message from the host or another connected device, relayed
+          // by server.py's ControlSession.broadcast(). Format: CHAT:<label>:<text>
+          const [from, ...rest] = line.slice('CHAT:'.length).split(':');
+          mainWindow?.webContents.send('chat-message', { from, text: rest.join(':'), time: Date.now(), source: 'remote' });
+          continue;
+        }
+
+        if (line.startsWith('FILE:')) {
+          // A file attachment from the host or another connected device.
+          // Format: FILE:<label>:<name_b64>:<data_b64> — name/content are
+          // base64 (no ':' in that alphabet), so only the label needs to
+          // stay colon-free, same assumption CHAT: already makes above.
+          const [from, nameB64, ...dataParts] = line.slice('FILE:'.length).split(':');
+          const saved = saveReceivedFile(nameB64, dataParts.join(':'));
+          mainWindow?.webContents.send('chat-message', {
+            from, time: Date.now(), source: 'remote',
+            fileName: saved?.fileName || '(file)', savedPath: saved?.savedPath,
+          });
+          continue;
+        }
+
+        if (line.startsWith('CHAT_ERROR:')) {
+          mainWindow?.webContents.send('chat-message', { error: line.slice('CHAT_ERROR:'.length), time: Date.now() });
+          continue;
+        }
       }
     });
 
@@ -566,17 +855,34 @@ ipcMain.handle('control-send', async (_, cmd) => {
   });
 });
 
+// Client-side "send a file to the host" — opens the picker, then reuses
+// the same control socket chat rides on. See pickAndReadFileForChat.
+ipcMain.handle('send-client-file', async () => {
+  if (!controlSocket || controlSocket.destroyed) return { ok: false, error: 'Not connected' };
+  const picked = await pickAndReadFileForChat();
+  if (picked.canceled) return { ok: false, canceled: true };
+  if (picked.error) return { ok: false, error: picked.error };
+  return new Promise((resolve) => {
+    controlSocket.write(picked.cmd + '\n', (err) => {
+      resolve(err ? { ok: false, error: err.message } : { ok: true, fileName: picked.fileName });
+    });
+  });
+});
+
 // Sends a single command to server.py's loopback-only admin port and
 // resolves with the first line of its response. Never reachable remotely
 // — this is strictly the local host UI talking to its own Python process.
-function adminRequest(command) {
+// Commands are newline-terminated because server.py now reads a full line
+// (rather than a single small recv) so that file: payloads — base64, and
+// easily much bigger than a short command — aren't silently truncated.
+function adminRequest(command, timeoutMs = 3000) {
   return new Promise((resolve) => {
     const net = require('net');
     const socket = new net.Socket();
     let buf = '';
-    socket.setTimeout(3000);
+    socket.setTimeout(timeoutMs);
     socket.connect(ADMIN_PORT, '127.0.0.1', () => {
-      socket.write(command);
+      socket.write(command + '\n');
     });
     socket.on('data', (data) => {
       buf += data.toString();
@@ -604,6 +910,201 @@ ipcMain.handle('grant-control', async (_, clientId) => {
 // connected device view-only until the host grants someone again.
 ipcMain.handle('revoke-control', async () => {
   const res = await adminRequest('revoke');
+  return { ok: res === 'OK' };
+});
+
+// ─── Pairing (password + host acceptance) ─────────────────────────────────
+// Every connection — found by direct IP or by resolving an ID — has to go
+// through this before it gets a session token. The promise stays pending
+// for as long as server.py's pairing port is blocked waiting on the host's
+// Accept/Deny decision (up to security.PAIR_TIMEOUT_SECONDS on the Python
+// side), so the timeout here is deliberately generous.
+ipcMain.handle('pair-connect', async (_, host, port, password, label) => {
+  let socket;
+  try {
+    socket = await connectSecure(host, port || 9997, 8000);
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+
+  return new Promise((resolve) => {
+    let buf = '';
+    let settled = false;
+
+    socket.write(JSON.stringify({ password: password || '', label: label || os.hostname() }) + '\n');
+
+    const timeout = setTimeout(() => {
+      if (!settled) { settled = true; socket.destroy(); resolve({ ok: false, error: 'Pairing request timed out' }); }
+    }, 75000); // server-side pairing window (60s) + margin
+
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      const newlineIndex = buf.indexOf('\n');
+      if (newlineIndex === -1) return;
+      const line = buf.slice(0, newlineIndex);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        const payload = JSON.parse(line);
+        if (payload.status === 'accepted') {
+          resolve({ ok: true, accepted: true, token: payload.token });
+        } else {
+          resolve({ ok: true, accepted: false, reason: payload.reason || 'denied' });
+        }
+      } catch (e) {
+        resolve({ ok: false, error: 'Malformed pairing response' });
+      }
+      socket.destroy();
+    });
+
+    socket.on('error', (e) => {
+      if (!settled) { settled = true; clearTimeout(timeout); resolve({ ok: false, error: e.message }); }
+    });
+    socket.on('close', () => {
+      if (!settled) { settled = true; clearTimeout(timeout); resolve({ ok: false, error: 'Connection closed before pairing completed' }); }
+    });
+  });
+});
+
+// ─── LAN "connect by ID" discovery ─────────────────────────────────────────
+// Broadcasts a UDP query on the local network asking whoever holds this
+// Device ID to identify itself, and resolves with the IP the reply came
+// from. Only finds hosts on the same broadcast domain — see security.py's
+// module docstring for why there's no internet-wide equivalent here.
+ipcMain.handle('resolve-id', async (_, deviceId) => {
+  return new Promise((resolve) => {
+    const socket = dgram.createSocket('udp4');
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try { socket.close(); } catch (e) { /* already closing */ }
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => finish({ ok: false, error: 'No response — device may be offline or on a different network' }), 4000);
+
+    socket.on('error', (e) => { clearTimeout(timeout); finish({ ok: false, error: e.message }); });
+
+    socket.bind(() => {
+      socket.setBroadcast(true);
+      const query = Buffer.from(JSON.stringify({ magic: DISCOVERY_MAGIC, type: 'query', id: deviceId }));
+      socket.send(query, DISCOVERY_PORT, '255.255.255.255');
+    });
+
+    socket.on('message', (msg, rinfo) => {
+      try {
+        const payload = JSON.parse(msg.toString('utf8'));
+        if (payload.magic === DISCOVERY_MAGIC && payload.type === 'reply' && payload.id === deviceId) {
+          clearTimeout(timeout);
+          finish({ ok: true, ip: rinfo.address, hostname: payload.hostname });
+        }
+      } catch (e) { /* ignore malformed packets */ }
+    });
+  });
+});
+
+// ─── Device identity (ID + password) ───────────────────────────────────────
+// The ID/password are read from (or created in) device.json directly, so
+// they're available immediately — on the Home/Settings/Server pages alike
+// — whether or not a host session is currently running. The ID is
+// permanent: it's generated exactly once (loadOrCreateDeviceIdentity) and
+// every subsequent call just reads the same file back.
+//
+// The password can still change (via "Generate New Password" or a
+// permanent one set from Settings). If server.py is currently running, we
+// also push the change to it over the admin port so its in-memory copy —
+// loaded once at startup — stays in sync without needing a restart;
+// either way the change is written to disk first, so it survives even if
+// no session is currently hosting.
+ipcMain.handle('get-device-id', () => {
+  try {
+    return { ok: true, ...loadOrCreateDeviceIdentity() };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('regen-host-password', async () => {
+  try {
+    const { id } = loadOrCreateDeviceIdentity();
+    const password = generatePassword();
+    fs.writeFileSync(DEVICE_IDENTITY_PATH, JSON.stringify({ id, password }));
+    if (serverRunning) await adminRequest(`set-password:${password}`);
+    return { ok: true, password };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Sets a specific, permanent password (as opposed to a random regenerated
+// one) — used by the Settings page. Stays in effect across restarts until
+// changed again here.
+ipcMain.handle('set-host-password', async (_, newPassword) => {
+  const password = (newPassword || '').trim();
+  if (!password) return { ok: false, error: 'Password cannot be empty' };
+  try {
+    const { id } = loadOrCreateDeviceIdentity();
+    fs.writeFileSync(DEVICE_IDENTITY_PATH, JSON.stringify({ id, password }));
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+  if (serverRunning) {
+    const res = await adminRequest(`set-password:${password}`);
+    if (res !== 'OK') return { ok: false, error: res || 'Failed to apply while hosting' };
+  }
+  return { ok: true, password };
+});
+
+// ─── Pending pairing requests (host-side accept/deny) ──────────────────────
+ipcMain.handle('accept-request', async (_, requestId) => {
+  const res = await adminRequest(`accept:${requestId}`);
+  return { ok: res === 'OK' };
+});
+
+ipcMain.handle('deny-request', async (_, requestId) => {
+  const res = await adminRequest(`deny:${requestId}`);
+  return { ok: res === 'OK' };
+});
+
+// ─── Host-side chat ─────────────────────────────────────────────────────
+// The host isn't a control-channel client itself (it talks to server.py
+// over the local admin port, not a TCP control connection), so its
+// outgoing messages and its chat on/off toggle go through here rather
+// than through control-send. Incoming messages from remote devices arrive
+// separately via the 'chat-message' push (see the CHAT_MARKER stdout
+// parsing above).
+ipcMain.handle('send-host-chat', async (_, text) => {
+  const res = await adminRequest(`chat:${text}`);
+  return { ok: res === 'OK', error: res && res.startsWith('ERR') ? res : undefined };
+});
+
+// Host-side "send a file to everyone connected" — opens the picker, then
+// reuses the admin port the same way send-host-chat does. Bigger timeout
+// than a plain chat message since the payload can be a few MB of base64.
+ipcMain.handle('send-host-file', async () => {
+  const picked = await pickAndReadFileForChat();
+  if (picked.canceled) return { ok: false, canceled: true };
+  if (picked.error) return { ok: false, error: picked.error };
+  const res = await adminRequest(picked.cmd, 15000);
+  return { ok: res === 'OK', error: res && res.startsWith('ERR') ? res : undefined, fileName: picked.fileName };
+});
+
+// Settings-page chat default — persisted so it applies from the very
+// start of the *next* hosted session (see startPythonServer's
+// --chat-disabled flag above). If a session is already running, this also
+// applies it live via the admin port, same as ServerPage's own toggle —
+// the two are meant to stay in sync, this just gives Settings a way to
+// set it before ever hosting, or to change the default without opening
+// the Chat panel.
+ipcMain.handle('get-chat-default', () => store.get('chatEnabledDefault', true));
+
+ipcMain.handle('set-chat-enabled', async (_, enabled) => {
+  store.set('chatEnabledDefault', !!enabled);
+  if (!pythonProc) return { ok: true }; // not hosting — default alone was all there was to do
+  const res = await adminRequest(enabled ? 'set-chat:on' : 'set-chat:off');
   return { ok: res === 'OK' };
 });
 
