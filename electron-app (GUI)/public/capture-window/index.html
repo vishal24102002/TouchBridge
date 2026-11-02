@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /><title>TouchBridge Capture</title></head>
+<body>
+  <!-- Never shown — this window stays hidden (show: false) in electron.js.
+       Uses visibility:hidden + off-screen positioning rather than
+       display:none: some Chromium versions throttle/pause video frame
+       decoding for display:none elements, which would starve the canvas
+       of fresh frames regardless of quality settings. -->
+  <video id="video" autoplay muted playsinline
+    style="position:absolute; top:-9999px; left:-9999px; width:1px; height:1px; visibility:hidden;"></video>
+  <canvas id="canvas" style="display:none"></canvas>
+  <script src="capture-renderer.js"></script>
+</body>
+</html>
