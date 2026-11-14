@@ -13,11 +13,15 @@ class SettingsService extends ChangeNotifier {
   static const _kDefaultHost = 'default_host';
   static const _kScreenPort = 'screen_port';
   static const _kControlPort = 'control_port';
+  static const _kPairPort = 'pair_port';
+  static const _kLabel = 'device_label';
 
   AppThemeId themeId = AppThemeId.matrix; // Matrix is the default theme
   String defaultHost = '';
   int screenPort = 8080;
   int controlPort = 9999;
+  int pairPort = 9997; // pairing/handshake port, matches server.py's default
+  String deviceLabel = ''; // friendly name shown to hosts you pair with
 
   SharedPreferences? _prefs;
 
@@ -26,13 +30,15 @@ class SettingsService extends ChangeNotifier {
     final storedTheme = _prefs!.getString(_kTheme);
     if (storedTheme != null) {
       themeId = AppThemeId.values.firstWhere(
-        (e) => e.name == storedTheme,
+            (e) => e.name == storedTheme,
         orElse: () => AppThemeId.matrix,
       );
     }
     defaultHost = _prefs!.getString(_kDefaultHost) ?? '';
     screenPort = _prefs!.getInt(_kScreenPort) ?? 8080;
     controlPort = _prefs!.getInt(_kControlPort) ?? 9999;
+    pairPort = _prefs!.getInt(_kPairPort) ?? 9997;
+    deviceLabel = _prefs!.getString(_kLabel) ?? '';
     notifyListeners();
   }
 
@@ -59,6 +65,18 @@ class SettingsService extends ChangeNotifier {
   Future<void> setControlPort(int port) async {
     controlPort = port;
     await _prefs?.setInt(_kControlPort, port);
+    notifyListeners();
+  }
+
+  Future<void> setPairPort(int port) async {
+    pairPort = port;
+    await _prefs?.setInt(_kPairPort, port);
+    notifyListeners();
+  }
+
+  Future<void> setDeviceLabel(String label) async {
+    deviceLabel = label;
+    await _prefs?.setString(_kLabel, label);
     notifyListeners();
   }
 }

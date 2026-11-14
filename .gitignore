@@ -23,6 +23,8 @@ releases/
 *.dmg
 *.snap
 *.zip
+*.pyc
+.lock
 
 # =========================
 # Environment files

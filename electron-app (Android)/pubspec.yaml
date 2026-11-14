@@ -7,6 +7,9 @@ environment:
   sdk: '>=3.0.0 <4.0.0'
 
 dependencies:
+  basic_utils: ^5.8.0      # pure-Dart RSA keypair + self-signed X.509 cert (Server Mode's TLS)
+  path_provider: ^2.1.0    # persistent per-install config dir (device id, cert/key files)
+  crypto: ^3.0.0
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.6

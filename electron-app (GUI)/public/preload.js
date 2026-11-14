@@ -22,7 +22,19 @@ contextBridge.exposeInMainWorld('api', {
 
   // Screen capture (single frame via TCP 8080, TLS + session token) — used
   // by Client Mode when THIS machine is viewing a remote host.
-  captureScreen: (host, port, token) => ipcRenderer.invoke('capture-screen', host, port, token),
+  screenStreamStart: (host, port, token) => ipcRenderer.invoke('screen-stream-start', host, port, token),
+  screenStreamStop: () => ipcRenderer.invoke('screen-stream-stop'),
+  screenFrameDone: () => ipcRenderer.send('screen-frame-done'),
+  onScreenFrame: (cb) => {
+    const h = (_, ab, mime) => cb(ab, mime);
+    ipcRenderer.on('screen-frame', h);
+    return () => ipcRenderer.removeListener('screen-frame', h);
+  },
+  onScreenStreamEnded: (cb) => {
+    const h = (_, reason) => cb(reason);
+    ipcRenderer.on('screen-stream-ended', h);
+    return () => ipcRenderer.removeListener('screen-stream-ended', h);
+  },
 
   // Control socket (TCP 9999, TLS + session token)
   controlConnect:    (host, port, token) => ipcRenderer.invoke('control-connect', host, port, token),

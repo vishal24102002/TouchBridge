@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PLACE: merge this <string> entry into your existing
+  android/app/src/main/res/values/strings.xml (create that file with this
+  content if you don't have one yet). Don't overwrite an existing
+  strings.xml wholesale — just add this one <string> to it.
+-->
+<resources>
+    <string name="accessibility_service_description">Lets TouchBridge relay taps, drags, typing, and shortcuts from a paired device you\'ve explicitly accepted a connection from.</string>
+</resources>

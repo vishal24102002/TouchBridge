@@ -11,10 +11,11 @@ stdin, length-prefixed:
 This script:
   1. Reads that stream on a background thread and keeps the most recent
      frame in memory (FrameBuffer).
-  2. Serves it on TCP port 8080 (TLS-wrapped) using a request/response
-     protocol: client connects, sends "capture:<session-token>\n", this
-     server writes the latest JPEG/PNG bytes back and closes the
-     connection — but only if that token is currently valid (see below).
+  2. Serves it on TCP port 8080 (TLS-wrapped). Preferred: the client sends
+     "stream:<session-token>\n" once and then receives a continuous
+     [4-byte length][JPEG/PNG] stream, newest frame only (zero length =
+     keepalive). Legacy: "capture:<session-token>\n" returns one frame and
+     closes. Either way the token must currently be valid (see below).
   3. Runs a persistent TCP control server on port 9999 (also TLS-wrapped):
      newline-delimited text commands, but the very first line a client
      sends must be "AUTH:<session-token>\n" before anything else is
@@ -113,24 +114,36 @@ def log(msg: str):
 # Frame buffer — filled by the stdin reader thread, read by screen clients
 # ─────────────────────────────────────────────────────────────────────────
 class FrameBuffer:
+    """Holds only the NEWEST frame. Each streaming viewer waits on the
+    condition and always gets the latest one, so a slow viewer skips frames
+    instead of falling behind (this is what keeps latency flat)."""
+
     def __init__(self):
-        self._lock = threading.Lock()
+        self._cond = threading.Condition()
         self._frame = b""
-        self._frame_count = 0
+        self._seq = 0
 
     def set(self, data: bytes):
-        with self._lock:
+        with self._cond:
             self._frame = data
-            self._frame_count += 1
+            self._seq += 1
+            self._cond.notify_all()
 
     def get(self) -> bytes:
-        with self._lock:
+        with self._cond:
             return self._frame
+
+    def wait_newer(self, last_seq: int, timeout: float):
+        """Block until a frame newer than last_seq exists (or timeout)."""
+        with self._cond:
+            if self._seq == last_seq:
+                self._cond.wait(timeout)
+            return self._seq, self._frame
 
     @property
     def count(self) -> int:
-        with self._lock:
-            return self._frame_count
+        with self._cond:
+            return self._seq
 
 
 frame_buffer = FrameBuffer()
@@ -153,7 +166,7 @@ def stdin_reader_thread():
         frame_buffer.set(payload)
         if frame_buffer.count == 1:
             log("First frame received from Electron")
-        elif frame_buffer.count % 50 == 0:
+        elif frame_buffer.count % 900 == 0:
             log(f"Received {frame_buffer.count} frames so far")
 
 
@@ -173,7 +186,31 @@ def _read_exact(stream, n: int):
 # "capture:<session-token>\n"; a missing/invalid/expired token gets no
 # data back at all (connection just closes).
 # ─────────────────────────────────────────────────────────────────────────
+def _tune_socket(sock: socket.socket):
+    """Disable Nagle so small control packets and frame headers go out
+    immediately instead of waiting to be batched."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
+STREAM_SNDBUF_BYTES = 256 * 1024
+STREAM_SEND_TIMEOUT = 5.0      # a viewer that can't accept data for this long is dropped
+STREAM_KEEPALIVE_SECS = 5.0    # idle screen -> send an empty frame so dead peers are noticed
+STREAM_REVALIDATE_SECS = 2.0   # stop streaming soon after a token is revoked/expired
+
+
 def handle_screen_client(conn: socket.socket, addr):
+    _tune_socket(conn)
+    try:
+        # Small send buffer = backpressure. Without this the OS queues MBs of
+        # already-stale frames for a slow viewer and latency grows for seconds.
+        # With it, sendall() blocks once ~2 frames are in flight and the loop
+        # below then picks up the NEWEST frame instead of the oldest.
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STREAM_SNDBUF_BYTES)
+    except OSError:
+        pass
     try:
         tls_conn = SSL_CONTEXT.wrap_socket(conn, server_side=True)
     except Exception as e:
@@ -184,16 +221,43 @@ def handle_screen_client(conn: socket.socket, addr):
     try:
         tls_conn.settimeout(5.0)
         request = tls_conn.recv(1024).decode("utf-8", errors="ignore").strip()
-        token = request.split(":", 1)[1] if request.startswith("capture:") else ""
-        if not pairing_manager.validate(token):
-            log(f"[ERR] screen client {addr[0]} sent an invalid/expired session token")
+        mode, _, token = request.partition(":")
+        if mode not in ("capture", "stream") or not pairing_manager.validate(token):
+            log(f"[ERR] screen client {addr[0]} sent an invalid request or expired session token")
             return
-        data = frame_buffer.get()
-        if data:
-            tls_conn.sendall(data)
-        # closing (falling out of `with`) triggers 'end' on the Electron side
+
+        if mode == "capture":
+            # Legacy one-shot mode: one frame, then close.
+            data = frame_buffer.get()
+            if data:
+                tls_conn.sendall(data)
+            return
+
+        # Streaming mode: [4-byte big-endian length][JPEG/PNG bytes], repeated.
+        # A zero-length frame is a keepalive. Only the newest frame is ever
+        # sent, so a slow viewer drops frames rather than building up lag.
+        log(f"Viewer streaming: {addr[0]}")
+        tls_conn.settimeout(STREAM_SEND_TIMEOUT)
+        last_seq = 0
+        last_sent = time.monotonic()
+        last_check = last_sent
+        while True:
+            seq, data = frame_buffer.wait_newer(last_seq, 1.0)
+            now = time.monotonic()
+            if seq != last_seq and data:
+                last_seq = seq
+                tls_conn.sendall(struct.pack(">I", len(data)) + data)
+                last_sent = now
+            elif now - last_sent >= STREAM_KEEPALIVE_SECS:
+                tls_conn.sendall(b"\x00\x00\x00\x00")
+                last_sent = now
+            if now - last_check >= STREAM_REVALIDATE_SECS:
+                last_check = now
+                if not pairing_manager.validate(token):
+                    log(f"Stream for {addr[0]} ended — session token no longer valid")
+                    return
     except Exception as e:
-        log(f"[ERR] screen client {addr[0]}: {e}")
+        log(f"Screen client {addr[0]} gone: {e}")
     finally:
         tls_conn.close()
 
@@ -481,6 +545,7 @@ def handle_command(cmd: str):
 
 
 def handle_control_client(conn: socket.socket, addr):
+    _tune_socket(conn)
     try:
         tls_conn = SSL_CONTEXT.wrap_socket(conn, server_side=True)
     except Exception as e:

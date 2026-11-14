@@ -54,6 +54,23 @@ const SHORTCUTS = [
 // field, unlike screen/control ports.
 const PAIR_PORT = 9997;
 
+// Shows one frame in the <img> and acks the main process once it is on
+// screen. The previous frame's object URL is released after the new one loads.
+function showFrame(img, url, onShown) {
+  const prev = img.dataset.url;
+  img.onload = () => {
+    if (prev) URL.revokeObjectURL(prev);
+    if (onShown) onShown();
+    window.api?.screenFrameDone();
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    window.api?.screenFrameDone();
+  };
+  img.dataset.url = url;
+  img.src = url;
+}
+
 export default function ClientPage() {
   const { setPage } = useNav();
 
@@ -73,7 +90,7 @@ export default function ClientPage() {
   const [pairStatus, setPairStatus] = useState(''); // shown while phase === 'connecting'
   const [sessionToken, setSessionToken] = useState(null); // issued after the host Accepts
   const [errorMsg, setErrorMsg] = useState('');
-  const [screenDataUrl, setScreenDataUrl] = useState(null);
+  const [hasFrame, setHasFrame] = useState(false); // frames are painted straight into the <img>, not via React state
   const [controlEnabled, setControlEnabled] = useState(false);
   const [controlPending, setControlPending] = useState(false); // connected, waiting on host to grant
   const [isCapturing, setIsCapturing] = useState(false);
@@ -101,12 +118,13 @@ export default function ClientPage() {
   const zoomOut = () => setZoom(z => Math.max(ZOOM_MIN, +(z - 0.25).toFixed(2)));
   const zoomReset = () => setZoom(1);
 
-  const captureTimeoutRef = useRef(null);
-  const capturingRef = useRef(false); // guards against overlapping in-flight requests
+  const imgRef = useRef(null);
+  const pendingUrlRef = useRef(null);
+  const capturingRef = useRef(false);
+  const streamArgsRef = useRef(null); // { host, port, token } for auto-retry / resume
   const fpsCounter = useRef(0);
   const fpsTimer = useRef(null);
 
-  const TARGET_FRAME_MS = 200; // ~5fps ceiling — never exceeded, but we back off if a frame takes longer
 
   // Load saved host
   useEffect(() => {
@@ -217,18 +235,16 @@ export default function ClientPage() {
     const token = pairRes.token;
     setSessionToken(token);
 
-    // Test screen connection via a single capture, now authenticated with
-    // the session token pairing just issued.
-    const capRes = await window.api?.captureScreen(targetHost, parseInt(screenPort), token);
-    if (!capRes?.ok) {
+    // Open the persistent screen stream, authenticated with the session
+    // token pairing just issued. The first frame proves the host is reachable.
+    const started = await startStream(targetHost, parseInt(screenPort), token);
+    if (!started.ok) {
       setErrorMsg(`Cannot reach ${targetHost}:${screenPort} — is the server running?`);
       setPhase('form');
       return;
     }
 
-    setScreenDataUrl(capRes.dataUrl);
     setPhase('connected');
-    startCapture(token);
 
     // Open the control channel right away, view-only until the host
     // grants otherwise — this is also what carries chat, so chat works
@@ -237,56 +253,77 @@ export default function ClientPage() {
     openControlChannel(targetHost, token);
   };
 
-  // Self-pacing loop instead of setInterval: each capture is requested only
-  // AFTER the previous one finishes (each capture-screen call is a fresh TCP
-  // round trip, and frames — especially PNG/Ultra ones — can easily take
-  // longer than 200ms). setInterval fires on a fixed clock regardless of
-  // whether the previous request has returned, so once a frame takes longer
-  // than the interval, requests start overlapping and pile up: more and more
-  // concurrent sockets hitting the host, responses arriving out of order,
-  // and the view falling further and further behind — which is exactly what
-  // "rendering feels slow" turns into over time. This loop can never overlap:
-  // it waits for the response, then waits out whatever's left of the frame
-  // budget (zero, if the request already took longer), before asking again.
-  const startCapture = useCallback((token) => {
-    const activeToken = token || sessionToken;
-    setIsCapturing(true);
-    capturingRef.current = true;
-    fpsCounter.current = 0;
-
-    fpsTimer.current = setInterval(() => {
-      setFps(fpsCounter.current);
+  // Frames arrive over ONE persistent connection (see electron.js
+  // 'screen-stream-start'); the main process only ever hands us the newest
+  // frame and waits for screenFrameDone() before sending the next, so a slow
+  // UI drops frames instead of falling behind.
+  const startStream = async (h, port, token) => {
+    streamArgsRef.current = { host: h, port, token };
+    const res = await window.api?.screenStreamStart(h, port, token);
+    if (res?.ok) {
+      capturingRef.current = true;
+      setIsCapturing(true);
       fpsCounter.current = 0;
-    }, 1000);
+      clearInterval(fpsTimer.current);
+      fpsTimer.current = setInterval(() => {
+        setFps(fpsCounter.current);
+        fpsCounter.current = 0;
+      }, 1000);
+    }
+    return res || { ok: false };
+  };
 
-    const loop = async () => {
-      if (!capturingRef.current) return;
-      const start = performance.now();
-      const res = await window.api?.captureScreen(host.trim(), parseInt(screenPort), activeToken);
-      if (!capturingRef.current) return; // stopped while the request was in flight
-      if (res?.ok) {
-        setScreenDataUrl(res.dataUrl);
-        fpsCounter.current++;
-      }
-      const elapsed = performance.now() - start;
-      const delay = Math.max(0, TARGET_FRAME_MS - elapsed);
-      captureTimeoutRef.current = setTimeout(loop, delay);
-    };
-    loop();
-  }, [host, screenPort, sessionToken]);
+  const startCapture = () => {
+    const a = streamArgsRef.current;
+    if (a) startStream(a.host, a.port, a.token);
+  };
 
   const stopCapture = () => {
     capturingRef.current = false;
-    clearTimeout(captureTimeoutRef.current);
     clearInterval(fpsTimer.current);
+    window.api?.screenStreamStop();
     setIsCapturing(false);
   };
 
+  // Paint a frame straight into the <img> (no React re-render per frame).
+  useEffect(() => {
+    if (!window.api?.onScreenFrame) return undefined;
+    const offFrame = window.api.onScreenFrame((ab, mime) => {
+      const url = URL.createObjectURL(new Blob([ab], { type: mime }));
+      const img = imgRef.current;
+      if (!img) { // first frame, <img> not mounted yet: the ref callback shows it
+        pendingUrlRef.current = url;
+        setHasFrame(true);
+        return;
+      }
+      showFrame(img, url, () => { fpsCounter.current++; });
+    });
+    const offEnded = window.api.onScreenStreamEnded(async () => {
+      if (!capturingRef.current) return;
+      // One quiet retry for a brief Wi-Fi hiccup, then fall back to Resume.
+      await new Promise(r => setTimeout(r, 500));
+      const a = streamArgsRef.current;
+      const res = a && capturingRef.current ? await window.api.screenStreamStart(a.host, a.port, a.token) : null;
+      if (!res?.ok) stopCapture();
+    });
+    return () => { offFrame?.(); offEnded?.(); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const setImgEl = useCallback((el) => {
+    imgRef.current = el;
+    if (el && pendingUrlRef.current) {
+      const u = pendingUrlRef.current;
+      pendingUrlRef.current = null;
+      showFrame(el, u);
+    }
+  }, []);
+
   const disconnect = async () => {
     stopCapture();
+    if (imgRef.current?.dataset.url) URL.revokeObjectURL(imgRef.current.dataset.url);
     await window.api?.controlDisconnect();
     setPhase('form');
-    setScreenDataUrl(null);
+    setHasFrame(false);
     setControlEnabled(false);
     setSessionToken(null);
     setChatAllowed(false);
@@ -381,13 +418,24 @@ export default function ClientPage() {
     setLastCmdStatus(res?.ok ? `✓ ${cmd}` : `✗ ${cmd}: ${res?.error}`);
   };
 
-  const sendMouseMove = async (e) => {
+  // Mouse deltas are accumulated and flushed once per animation frame: one
+  // command per frame instead of one per mouse event, with the sub-pixel
+  // remainder carried over so slow movements aren't lost.
+  const moveAcc = useRef({ dx: 0, dy: 0, raf: 0 });
+  const sendMouseMove = (e) => {
     if (!controlEnabled) return;
-    // Compensate for zoom: at 2x zoom, a 10px screen-space movement should
-    // only move the remote cursor 5px, since the image itself is scaled up.
-    const dx = Math.round(e.movementX / zoom);
-    const dy = Math.round(e.movementY / zoom);
-    if (dx !== 0 || dy !== 0) sendCmd(`mouse_move:${dx},${dy}`);
+    const a = moveAcc.current;
+    // Compensate for zoom: at 2x zoom, 10px of screen movement is 5px remotely.
+    a.dx += e.movementX / zoom;
+    a.dy += e.movementY / zoom;
+    if (a.raf) return;
+    a.raf = requestAnimationFrame(() => {
+      a.raf = 0;
+      const dx = Math.round(a.dx), dy = Math.round(a.dy);
+      a.dx -= dx;
+      a.dy -= dy;
+      if (dx || dy) window.api?.controlSend(`mouse_move:${dx},${dy}`);
+    });
   };
 
   const sendMouseClick = async (e) => {
@@ -650,10 +698,10 @@ export default function ClientPage() {
               onMouseDown={controlEnabled ? sendMouseClick : undefined}
               onContextMenu={e => controlEnabled && e.preventDefault()}
             >
-              {screenDataUrl ? (
+              {hasFrame ? (
                 <img
                   className="screen-img"
-                  src={screenDataUrl}
+                  ref={setImgEl}
                   alt="Remote Screen"
                   draggable={false}
                   style={{
@@ -663,7 +711,7 @@ export default function ClientPage() {
                     display: 'block',
                     transform: `scale(${zoom})`,
                     transformOrigin: 'center center',
-                    transition: 'transform 0.1s ease-out',
+                    transition: zoom === 1 ? 'none' : 'transform 0.1s ease-out',
                   }}
                 />
               ) : (
@@ -689,7 +737,7 @@ export default function ClientPage() {
             <div className="toolbar">
               <button
                 className={`btn btn-icon ${isCapturing ? 'active' : ''}`}
-                onClick={isCapturing ? stopCapture : () => startCapture()}
+                onClick={isCapturing ? stopCapture : startCapture}
               >
                 {isCapturing ? '⏸ Pause' : '▶ Resume'}
               </button>

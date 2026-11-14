@@ -1,9 +1,13 @@
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/network_service.dart';
+import '../services/security_service.dart' show ChatMessage;
 import '../services/settings_service.dart';
 import '../widgets/common.dart';
+
+enum _ConnectBy { ip, id }
 
 class ClientScreen extends StatefulWidget {
   const ClientScreen({super.key});
@@ -14,9 +18,14 @@ class ClientScreen extends StatefulWidget {
 
 class _ClientScreenState extends State<ClientScreen> {
   late final TextEditingController _hostController;
+  late final TextEditingController _idController;
+  late final TextEditingController _passwordController;
+  late final TextEditingController _labelController;
   final RemoteSession _session = RemoteSession();
 
-  bool _connecting = false;
+  _ConnectBy _connectBy = _ConnectBy.ip;
+  bool _resolving = false;
+  bool _pairing = false;
   bool _connected = false;
   String? _error;
 
@@ -25,32 +34,110 @@ class _ClientScreenState extends State<ClientScreen> {
     super.initState();
     final settings = context.read<SettingsService>();
     _hostController = TextEditingController(text: settings.defaultHost);
+    _idController = TextEditingController();
+    _passwordController = TextEditingController();
+    _labelController = TextEditingController(
+      text: settings.deviceLabel.isNotEmpty ? settings.deviceLabel : 'My Phone',
+    );
   }
 
   Future<void> _connect(SettingsService settings) async {
-    final host = _hostController.text.trim();
-    if (host.isEmpty) {
-      setState(() => _error = 'Enter the server IP address');
-      return;
-    }
     setState(() {
-      _connecting = true;
       _error = null;
     });
+
+    String host;
+    if (_connectBy == _ConnectBy.id) {
+      final id = _idController.text.trim();
+      if (id.length != 9) {
+        setState(() => _error = 'Enter the 9-digit Device ID');
+        return;
+      }
+      setState(() => _resolving = true);
+      final resolved = await RemoteSession.resolveDeviceId(id);
+      setState(() => _resolving = false);
+      if (resolved == null) {
+        setState(() => _error = 'Could not find that device on this network');
+        return;
+      }
+      host = resolved;
+    } else {
+      host = _hostController.text.trim();
+      if (host.isEmpty) {
+        setState(() => _error = 'Enter the server IP address');
+        return;
+      }
+    }
+
+    final password = _passwordController.text;
+    if (password.isEmpty) {
+      setState(() => _error = 'Enter the host\'s password');
+      return;
+    }
+    final label = _labelController.text.trim().isEmpty ? 'My Phone' : _labelController.text.trim();
+    await settings.setDeviceLabel(label);
+
+    setState(() => _pairing = true);
     try {
-      await _session.connect(host, settings.screenPort, settings.controlPort);
+      await _session.connect(
+        host,
+        settings.screenPort,
+        settings.controlPort,
+        settings.pairPort,
+        password,
+        label,
+      );
       if (!mounted) return;
       setState(() {
-        _connecting = false;
+        _pairing = false;
         _connected = true;
       });
+    } on PairingDeniedException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _pairing = false;
+        _error = switch (e.reason) {
+          'bad_password' => 'Wrong password',
+          'host_declined_or_timeout' => 'The host denied the request, or it timed out',
+          _ => 'Pairing failed (${e.reason})',
+        };
+      });
+    } on CertificateChangedException catch (e) {
+      if (!mounted) return;
+      setState(() => _pairing = false);
+      final trustAnyway = await _showCertMismatchDialog(host);
+      if (trustAnyway == true) {
+        await CertPinStore.clear(host);
+        _connect(settings);
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _connecting = false;
+        _pairing = false;
         _error = 'Could not connect: $e';
       });
     }
+  }
+
+  Future<bool?> _showCertMismatchDialog(String host) {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Host identity changed'),
+        content: Text(
+          'The security certificate for $host does not match the one seen last time. '
+              'This can happen if the host reinstalled TouchBridge — or it could mean someone '
+              'else is impersonating it on this network.\n\nOnly continue if you\'re sure.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Trust anyway', style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
   }
 
   void _disconnect() {
@@ -62,21 +149,21 @@ class _ClientScreenState extends State<ClientScreen> {
   void dispose() {
     _session.dispose();
     _hostController.dispose();
+    _idController.dispose();
+    _passwordController.dispose();
+    _labelController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     if (_connected) {
-      return _RemoteView(
-        session: _session,
-        onDisconnect: _disconnect,
-        controlAllowed: _session.control.allowed,
-      );
+      return _RemoteView(session: _session, onDisconnect: _disconnect);
     }
 
     final settings = context.watch<SettingsService>();
     final theme = settings.currentTheme;
+    final busy = _resolving || _pairing;
 
     return Scaffold(
       appBar: buildSubAppBar(context, plainPart: 'Client', accentPart: 'Mode'),
@@ -84,22 +171,72 @@ class _ClientScreenState extends State<ClientScreen> {
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
           children: [
+            // Segmented IP-vs-ID toggle — stacked full-width beats a
+            // cramped two-tab row on narrow phones.
+            Container(
+              padding: const EdgeInsets.all(4),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.15)),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _SegmentButton(
+                      label: 'By IP Address',
+                      selected: _connectBy == _ConnectBy.ip,
+                      color: theme.accent,
+                      onTap: () => setState(() => _connectBy = _ConnectBy.ip),
+                    ),
+                  ),
+                  Expanded(
+                    child: _SegmentButton(
+                      label: 'By Device ID',
+                      selected: _connectBy == _ConnectBy.id,
+                      color: theme.accent,
+                      onTap: () => setState(() => _connectBy = _ConnectBy.id),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+
             OutlinedPanel(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const KickerLabel('Server Address'),
+                  KickerLabel(_connectBy == _ConnectBy.ip ? 'Server Address' : 'Device ID'),
                   const SizedBox(height: 10),
-                  TextField(
-                    controller: _hostController,
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 20),
-                    keyboardType: TextInputType.text,
-                    decoration: const InputDecoration(
-                      hintText: '192.168.1.100',
-                      isDense: true,
-                      contentPadding: EdgeInsets.symmetric(vertical: 16, horizontal: 14),
+                  if (_connectBy == _ConnectBy.ip)
+                    TextField(
+                      controller: _hostController,
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 20),
+                      decoration: const InputDecoration(
+                        hintText: '192.168.1.100',
+                        isDense: true,
+                        contentPadding: EdgeInsets.symmetric(vertical: 16, horizontal: 14),
+                      ),
+                    )
+                  else
+                    TextField(
+                      controller: _idController,
+                      keyboardType: TextInputType.number,
+                      maxLength: 9,
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 22, letterSpacing: 2),
+                      decoration: const InputDecoration(
+                        hintText: '123 456 789',
+                        counterText: '',
+                        isDense: true,
+                        contentPadding: EdgeInsets.symmetric(vertical: 16, horizontal: 14),
+                      ),
                     ),
-                  ),
+                  const SizedBox(height: 4),
+                  if (_connectBy == _ConnectBy.id)
+                    Text(
+                      'Only works on the same Wi-Fi/LAN as the host.',
+                      style: TextStyle(fontSize: 11, color: theme.textSecondary, fontFamily: 'monospace'),
+                    ),
                   const SizedBox(height: 16),
                   Row(
                     children: [
@@ -111,6 +248,40 @@ class _ClientScreenState extends State<ClientScreen> {
                 ],
               ),
             ),
+            const SizedBox(height: 14),
+
+            OutlinedPanel(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const KickerLabel('Host Password'),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _passwordController,
+                    obscureText: true,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 18),
+                    decoration: const InputDecoration(
+                      hintText: 'Password shown on the host',
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(vertical: 14, horizontal: 14),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const KickerLabel('Your Label'),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _labelController,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 16),
+                    decoration: const InputDecoration(
+                      hintText: 'How you\'ll appear to the host',
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(vertical: 12, horizontal: 14),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
             if (_error != null) ...[
               const SizedBox(height: 12),
               Text(_error!, style: const TextStyle(color: Colors.redAccent, fontSize: 13)),
@@ -123,9 +294,9 @@ class _ClientScreenState extends State<ClientScreen> {
                 children: [
                   const KickerLabel('Quick Tips'),
                   const SizedBox(height: 14),
-                  _Tip('Both devices must be on the same Wi-Fi'),
-                  _Tip('Start Server Mode on the host device first'),
-                  _Tip('Check firewall if connection fails'),
+                  const _Tip('Both devices must be on the same Wi-Fi'),
+                  const _Tip('Start Server Mode on the host device first'),
+                  const _Tip('The host must tap Accept before you connect'),
                 ],
               ),
             ),
@@ -134,26 +305,57 @@ class _ClientScreenState extends State<ClientScreen> {
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
-                onPressed: _connecting ? null : () => _connect(settings),
-                icon: _connecting
+                onPressed: busy ? null : () => _connect(settings),
+                icon: busy
                     ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
-                      )
+                  width: 18, height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
+                )
                     : const Icon(Icons.add_link_rounded),
-                label: Text(_connecting ? 'Connecting…' : 'Connect'),
+                label: Text(_resolving ? 'Finding device…' : (_pairing ? 'Waiting for host…' : 'Connect')),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: theme.accent,
                   foregroundColor: Colors.black,
                   padding: const EdgeInsets.symmetric(vertical: 18),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                  textStyle: const TextStyle(
-                      fontFamily: 'monospace', fontSize: 17, fontWeight: FontWeight.bold),
+                  textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 17, fontWeight: FontWeight.bold),
                 ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SegmentButton extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final Color color;
+  final VoidCallback onTap;
+  const _SegmentButton({required this.label, required this.selected, required this.color, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(9),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: selected ? color.withValues(alpha: 0.15) : Colors.transparent,
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontFamily: 'monospace',
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: selected ? color : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6),
+          ),
         ),
       ),
     );
@@ -179,11 +381,7 @@ class _PortChip extends StatelessWidget {
         children: [
           Text(label, style: const TextStyle(fontFamily: 'monospace', fontSize: 14)),
           Text(value,
-              style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                  color: theme.accent)),
+              style: TextStyle(fontFamily: 'monospace', fontSize: 14, fontWeight: FontWeight.bold, color: theme.accent)),
         ],
       ),
     );
@@ -209,17 +407,13 @@ class _Tip extends StatelessWidget {
   }
 }
 
-/// Full-screen live remote view: renders incoming JPEG frames and forwards
-/// taps/drags to the control channel as normalized (0-1) coordinates.
+/// Full-screen live remote view: renders incoming JPEG frames, forwards
+/// taps/drags to the control channel, and hosts the chat panel — this is
+/// the Flutter equivalent of ClientPage.js's canvas + sidebar.
 class _RemoteView extends StatefulWidget {
   final RemoteSession session;
   final VoidCallback onDisconnect;
-  final bool controlAllowed;
-  const _RemoteView({
-    required this.session,
-    required this.onDisconnect,
-    required this.controlAllowed,
-  });
+  const _RemoteView({required this.session, required this.onDisconnect});
 
   @override
   State<_RemoteView> createState() => _RemoteViewState();
@@ -227,15 +421,20 @@ class _RemoteView extends StatefulWidget {
 
 class _RemoteViewState extends State<_RemoteView> {
   Uint8List? _latestFrame;
+  int? _frameWidth;
+  int? _frameHeight;
   bool _controlsOpen = false;
+  bool _chatOpen = false;
   bool _zoomMode = false;
+  bool _controlAllowed = false;
+  bool _chatEnabled = true;
+  String? _capabilityNote;
   final _typeController = TextEditingController();
+  final _chatController = TextEditingController();
   final _transformController = TransformationController();
+  final List<ChatMessage> _chatMessages = [];
 
-  // Mirrors server.py's SHORTCUT_KEYS exactly — same names, same command
-  // strings sent over the control channel. Includes the non-printable keys
-  // (Tab, Caps Lock, Delete, F1-F12, etc.) that a touchscreen client has no
-  // other way to send, since typed text only covers printable characters.
+  // Mirrors server.py's SHORTCUT_KEYS exactly.
   static const List<_Shortcut> _shortcuts = [
     _Shortcut('Ctrl+C', 'ctrl_c'),
     _Shortcut('Ctrl+V', 'ctrl_v'),
@@ -272,47 +471,114 @@ class _RemoteViewState extends State<_RemoteView> {
   @override
   void initState() {
     super.initState();
+    _controlAllowed = widget.session.control.allowed;
     widget.session.screen.frames.listen((frame) {
       if (mounted) setState(() => _latestFrame = frame);
+      _updateFrameDimensions(frame);
+    });
+    widget.session.control.onGrantChanged.listen((granted) {
+      if (mounted) setState(() => _controlAllowed = granted);
+    });
+    widget.session.control.onChatStateChanged.listen((on) {
+      if (mounted) setState(() => _chatEnabled = on);
+    });
+    widget.session.control.onChat.listen((msg) {
+      if (mounted) setState(() => _chatMessages.add(msg));
+    });
+    widget.session.control.onError.listen((line) {
+      if (!mounted) return;
+      if (line.startsWith('NOCAP:')) {
+        setState(() => _capabilityNote = line.substring('NOCAP:'.length));
+      } else if (line == 'CHAT_ERROR:disabled') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Chat is currently disabled by the host')),
+        );
+      }
     });
   }
 
   @override
   void dispose() {
     _typeController.dispose();
+    _chatController.dispose();
     _transformController.dispose();
     super.dispose();
   }
 
-  // Zoom is a separate mode from remote-control gestures on purpose: a
-  // one-finger drag means "move the remote cursor" in control mode, but
-  // "pan the zoomed view" in zoom mode — those two can't coexist on the
-  // same gesture without constantly fighting each other. Toggle between
-  // them with the appbar icon.
   void _zoomBy(double factor) {
     final current = _transformController.value.getMaxScaleOnAxis();
     final next = (current * factor).clamp(1.0, 5.0);
     _transformController.value = Matrix4.identity()..scale(next);
   }
 
-  void _zoomReset() {
-    _transformController.value = Matrix4.identity();
-  }
+  void _zoomReset() => _transformController.value = Matrix4.identity();
 
-  // This protocol is trackpad-style: there's no "move cursor to x,y", only
-  // relative deltas (mouse_move:dx,dy) plus a click-at-current-position
-  // command. So a tap = click, and a drag = relative cursor movement,
-  // matching exactly how ClientPage.js's onMouseMove/onMouseDown work.
-  void _handleTapUp(TapUpDetails details) {
-    widget.session.control.sendClick();
-  }
-
-  void _handlePanUpdate(DragUpdateDetails details) {
-    final dx = details.delta.dx.round();
-    final dy = details.delta.dy.round();
-    if (dx != 0 || dy != 0) {
-      widget.session.control.sendMouseMoveRelative(dx, dy);
+  /// Decodes just enough of each frame to know its real pixel dimensions,
+  /// used to compute the actual rendered image content box (accounting
+  /// for BoxFit.contain letterboxing) so gestures can be mapped to an
+  /// exact absolute position — see _contentRectFor/_sendAbsoluteFromLocal.
+  /// Skipped once dimensions are already known and haven't changed size
+  /// class (still decodes the header on every frame, which is cheap
+  /// relative to the frame sizes this app sends, but avoids the
+  /// setState/rebuild when nothing actually changed).
+  Future<void> _updateFrameDimensions(Uint8List bytes) async {
+    try {
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final w = frame.image.width;
+      final h = frame.image.height;
+      frame.image.dispose();
+      codec.dispose();
+      if (mounted && (w != _frameWidth || h != _frameHeight)) {
+        setState(() {
+          _frameWidth = w;
+          _frameHeight = h;
+        });
+      }
+    } catch (_) {
+      // Malformed/partial frame — keep whatever dimensions we already
+      // have rather than losing gesture mapping over one bad frame.
     }
+  }
+
+  /// The real rendered image content rectangle within a box of [boxSize],
+  /// accounting for BoxFit.contain letterboxing — mirrors ClientPage.js's
+  /// recomputeContentRect. Null until the first frame's dimensions are
+  /// known.
+  Rect? _contentRectFor(Size boxSize) {
+    final fw = _frameWidth;
+    final fh = _frameHeight;
+    if (fw == null || fh == null || fw == 0 || fh == 0) return null;
+    if (boxSize.width == 0 || boxSize.height == 0) return null;
+
+    final boxAspect = boxSize.width / boxSize.height;
+    final imgAspect = fw / fh;
+    double contentWidth, contentHeight;
+    if (imgAspect > boxAspect) {
+      contentWidth = boxSize.width;
+      contentHeight = boxSize.width / imgAspect;
+    } else {
+      contentHeight = boxSize.height;
+      contentWidth = boxSize.height * imgAspect;
+    }
+    final left = (boxSize.width - contentWidth) / 2;
+    final top = (boxSize.height - contentHeight) / 2;
+    return Rect.fromLTWH(left, top, contentWidth, contentHeight);
+  }
+
+  /// Maps a tap/drag position (relative to the gesture box) to an
+  /// absolute fractional position and sends it — but only if that
+  /// position actually falls within the real image content, never the
+  /// empty letterboxed padding around it. Returns whether it sent
+  /// anything, so callers can skip firing a click for a tap that landed
+  /// outside the image.
+  bool _sendAbsoluteFromLocal(Offset localPosition, Size boxSize) {
+    final content = _contentRectFor(boxSize);
+    if (content == null || !content.contains(localPosition)) return false;
+    final fx = (localPosition.dx - content.left) / content.width;
+    final fy = (localPosition.dy - content.top) / content.height;
+    widget.session.control.sendMouseMoveAbsolute(fx, fy);
+    return true;
   }
 
   void _sendTypedText() {
@@ -320,6 +586,14 @@ class _RemoteViewState extends State<_RemoteView> {
     if (text.isEmpty) return;
     widget.session.control.sendText(text);
     _typeController.clear();
+  }
+
+  void _sendChat() {
+    final text = _chatController.text.trim();
+    if (text.isEmpty) return;
+    widget.session.control.sendChat(text);
+    setState(() => _chatMessages.add(ChatMessage(from: 'You', text: text, time: DateTime.now(), isMe: true)));
+    _chatController.clear();
   }
 
   Widget _buildFrame() {
@@ -330,8 +604,7 @@ class _RemoteViewState extends State<_RemoteView> {
           children: [
             CircularProgressIndicator(color: Colors.white54),
             SizedBox(height: 16),
-            Text('Waiting for first frame…',
-                style: TextStyle(color: Colors.white54, fontFamily: 'monospace')),
+            Text('Waiting for first frame…', style: TextStyle(color: Colors.white54, fontFamily: 'monospace')),
           ],
         ),
       );
@@ -343,26 +616,20 @@ class _RemoteViewState extends State<_RemoteView> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      // Just a back arrow up here now — everything else (zoom, controls,
-      // disconnect) moved to the bottom toolbar below, since cramming
-      // icons + a title + Disconnect into one top bar left no room to
-      // breathe on narrow phone screens.
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        elevation: 0,
-        toolbarHeight: 40,
-      ),
+      appBar: AppBar(backgroundColor: Colors.black, elevation: 0, toolbarHeight: 40),
       body: Column(
         children: [
-          if (!widget.controlAllowed)
+          if (!_controlAllowed)
             Container(
               width: double.infinity,
               color: Colors.amber.withValues(alpha: 0.15),
               padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-              child: const Text(
-                'View-only — the host has remote control disabled',
+              child: Text(
+                _capabilityNote != null
+                    ? 'View-only — $_capabilityNote'
+                    : 'View-only — the host hasn\'t granted you control',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.amber),
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.amber),
               ),
             ),
           Expanded(
@@ -370,35 +637,71 @@ class _RemoteViewState extends State<_RemoteView> {
               children: [
                 _zoomMode
                     ? InteractiveViewer(
-                        transformationController: _transformController,
-                        minScale: 1.0,
-                        maxScale: 5.0,
-                        child: SizedBox.expand(child: _buildFrame()),
-                      )
-                    : GestureDetector(
-                        // Gestures do nothing when control isn't allowed —
-                        // the control channel itself drops sends in that
-                        // state too (see ControlChannelClient._send), this
-                        // just avoids the pointless connection attempts.
-                        onTapUp: widget.controlAllowed ? _handleTapUp : null,
-                        onPanUpdate: widget.controlAllowed ? _handlePanUpdate : null,
-                        onLongPress: widget.controlAllowed
-                            ? () => widget.session.control.sendRightClick()
-                            : null,
-                        onDoubleTap: widget.controlAllowed
-                            ? () => widget.session.control.sendDoubleClick()
-                            : null,
-                        child: SizedBox.expand(child: _buildFrame()),
-                      ),
+                  transformationController: _transformController,
+                  minScale: 1.0,
+                  maxScale: 5.0,
+                  child: SizedBox.expand(child: _buildFrame()),
+                )
+                    : LayoutBuilder(
+                  builder: (context, constraints) {
+                    final boxSize = constraints.biggest;
+                    // Every gesture callback sends the exact
+                    // absolute position it fired at (only if that
+                    // position is actually within the real image,
+                    // per _sendAbsoluteFromLocal) before triggering
+                    // its click type — so taps, long-presses, and
+                    // double-taps all land precisely where touched,
+                    // not wherever a prior drag happened to leave
+                    // the virtual cursor.
+                    return GestureDetector(
+                      onTapUp: _controlAllowed
+                          ? (d) {
+                        if (_sendAbsoluteFromLocal(d.localPosition, boxSize)) {
+                          widget.session.control.sendClick();
+                        }
+                      }
+                          : null,
+                      onPanUpdate: _controlAllowed
+                          ? (d) => _sendAbsoluteFromLocal(d.localPosition, boxSize)
+                          : null,
+                      onLongPressStart: _controlAllowed
+                          ? (d) {
+                        if (_sendAbsoluteFromLocal(d.localPosition, boxSize)) {
+                          widget.session.control.sendRightClick();
+                        }
+                      }
+                          : null,
+                      onDoubleTapDown: _controlAllowed
+                          ? (d) => _sendAbsoluteFromLocal(d.localPosition, boxSize)
+                          : null,
+                      onDoubleTap: _controlAllowed ? () => widget.session.control.sendDoubleClick() : null,
+                      child: SizedBox.expand(child: _buildFrame()),
+                    );
+                  },
+                ),
+                if (_chatOpen)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: _ChatPanel(
+                      messages: _chatMessages,
+                      enabled: _chatEnabled,
+                      controller: _chatController,
+                      onSend: _sendChat,
+                      onClose: () => setState(() => _chatOpen = false),
+                    ),
+                  ),
               ],
             ),
           ),
-          if (widget.controlAllowed && _controlsOpen) _ControlPanel(
-            session: widget.session,
-            shortcuts: _shortcuts,
-            typeController: _typeController,
-            onSendText: _sendTypedText,
-          ),
+          if (_controlAllowed && _controlsOpen)
+            _ControlPanel(
+              session: widget.session,
+              shortcuts: _shortcuts,
+              typeController: _typeController,
+              onSendText: _sendTypedText,
+            ),
           _buildBottomToolbar(),
         ],
       ),
@@ -416,10 +719,8 @@ class _RemoteViewState extends State<_RemoteView> {
             children: [
               IconButton(
                 tooltip: _zoomMode ? 'Exit zoom' : 'Zoom',
-                icon: Icon(
-                  _zoomMode ? Icons.pan_tool_alt_rounded : Icons.zoom_in_rounded,
-                  color: _zoomMode ? Colors.cyanAccent : Colors.white,
-                ),
+                icon: Icon(_zoomMode ? Icons.pan_tool_alt_rounded : Icons.zoom_in_rounded,
+                    color: _zoomMode ? Colors.cyanAccent : Colors.white),
                 onPressed: () => setState(() {
                   _zoomMode = !_zoomMode;
                   if (!_zoomMode) _zoomReset();
@@ -437,11 +738,9 @@ class _RemoteViewState extends State<_RemoteView> {
                     final pct = (matrix.getMaxScaleOnAxis() * 100).round();
                     return SizedBox(
                       width: 44,
-                      child: Text(
-                        '$pct%',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.white70),
-                      ),
+                      child: Text('$pct%',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.white70)),
                     );
                   },
                 ),
@@ -457,13 +756,19 @@ class _RemoteViewState extends State<_RemoteView> {
                 ),
               ],
               const Spacer(),
-              if (widget.controlAllowed && !_zoomMode)
+              if (!_zoomMode)
+                IconButton(
+                  tooltip: 'Chat',
+                  icon: Badge(
+                    isLabelVisible: _chatMessages.isNotEmpty && !_chatOpen,
+                    child: const Icon(Icons.chat_bubble_outline_rounded, color: Colors.white, size: 20),
+                  ),
+                  onPressed: () => setState(() => _chatOpen = !_chatOpen),
+                ),
+              if (_controlAllowed && !_zoomMode)
                 IconButton(
                   tooltip: 'Controls',
-                  icon: Icon(
-                    _controlsOpen ? Icons.keyboard_hide_rounded : Icons.gamepad_outlined,
-                    color: Colors.white,
-                  ),
+                  icon: Icon(_controlsOpen ? Icons.keyboard_hide_rounded : Icons.gamepad_outlined, color: Colors.white),
                   onPressed: () => setState(() => _controlsOpen = !_controlsOpen),
                 ),
               TextButton.icon(
@@ -481,13 +786,13 @@ class _RemoteViewState extends State<_RemoteView> {
 
 class _Shortcut {
   final String label;
-  final String command; // matches server.py's SHORTCUT_KEYS names
+  final String command;
   const _Shortcut(this.label, this.command);
 }
 
 /// The slide-up panel: type-text field, mouse buttons, and the shortcut
-/// grid — this is the Flutter equivalent of ClientPage.js's sidebar
-/// "Remote Control" + "Shortcuts" boxes.
+/// grid — Flutter equivalent of ClientPage.js's sidebar "Remote Control" +
+/// "Shortcuts" boxes.
 class _ControlPanel extends StatelessWidget {
   final RemoteSession session;
   final List<_Shortcut> shortcuts;
@@ -503,10 +808,6 @@ class _ControlPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Cap the whole panel to a fraction of the screen so it can never push
-    // content off the bottom edge — the shortcut grid alone (18 keys +
-    // F1-F12 + quick apps) is taller than most phone screens can show at
-    // once, so it needs to scroll rather than just grow.
     final maxPanelHeight = MediaQuery.of(context).size.height * 0.42;
 
     return Container(
@@ -518,8 +819,6 @@ class _ControlPanel extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Type text + mouse buttons stay pinned above the scroll area
-            // so they're always reachable without scrolling.
             Padding(
               padding: const EdgeInsets.fromLTRB(14, 14, 14, 0),
               child: Row(
@@ -535,19 +834,13 @@ class _ControlPanel extends StatelessWidget {
                         filled: true,
                         fillColor: Colors.white.withValues(alpha: 0.06),
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(10),
-                          borderSide: BorderSide.none,
-                        ),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
                       ),
                       onSubmitted: (_) => onSendText(),
                     ),
                   ),
                   const SizedBox(width: 8),
-                  IconButton.filled(
-                    onPressed: onSendText,
-                    icon: const Icon(Icons.send_rounded, size: 18),
-                  ),
+                  IconButton.filled(onPressed: onSendText, icon: const Icon(Icons.send_rounded, size: 18)),
                 ],
               ),
             ),
@@ -555,25 +848,12 @@ class _ControlPanel extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
               child: Row(
                 children: [
-                  Expanded(
-                    child: _PanelButton(
-                      label: 'Right Click',
-                      onTap: () => session.control.sendRightClick(),
-                    ),
-                  ),
+                  Expanded(child: _PanelButton(label: 'Right Click', onTap: () => session.control.sendRightClick())),
                   const SizedBox(width: 8),
-                  Expanded(
-                    child: _PanelButton(
-                      label: 'Double Click',
-                      onTap: () => session.control.sendDoubleClick(),
-                    ),
-                  ),
+                  Expanded(child: _PanelButton(label: 'Double Click', onTap: () => session.control.sendDoubleClick())),
                 ],
               ),
             ),
-
-            // Everything below (shortcut grid + quick apps) scrolls within
-            // whatever height is left in the panel's budget.
             Flexible(
               child: SingleChildScrollView(
                 padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
@@ -592,15 +872,10 @@ class _ControlPanel extends StatelessWidget {
                       ),
                       itemBuilder: (context, i) {
                         final s = shortcuts[i];
-                        return _PanelButton(
-                          label: s.label,
-                          onTap: () => session.control.sendShortcut(s.command),
-                        );
+                        return _PanelButton(label: s.label, onTap: () => session.control.sendShortcut(s.command));
                       },
                     ),
                     const SizedBox(height: 12),
-
-                    // Quick apps / media, matching ClientPage.js's row 4
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
@@ -642,10 +917,120 @@ class _PanelButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
         ),
-        child: Text(
-          label,
-          textAlign: TextAlign.center,
-          style: const TextStyle(fontFamily: 'monospace', color: Colors.white, fontSize: 12),
+        child: Text(label, textAlign: TextAlign.center, style: const TextStyle(fontFamily: 'monospace', color: Colors.white, fontSize: 12)),
+      ),
+    );
+  }
+}
+
+/// In-session chat, relayed by the host over the control channel. Slides
+/// up from the bottom rather than living in a permanent sidebar, since a
+/// phone has no room to show the remote screen and a sidebar at once.
+class _ChatPanel extends StatelessWidget {
+  final List<ChatMessage> messages;
+  final bool enabled;
+  final TextEditingController controller;
+  final VoidCallback onSend;
+  final VoidCallback onClose;
+
+  const _ChatPanel({
+    required this.messages,
+    required this.enabled,
+    required this.controller,
+    required this.onSend,
+    required this.onClose,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: Container(
+        constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
+        decoration: const BoxDecoration(
+          color: Color(0xF0121212),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 8, 6),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text('Chat', style: TextStyle(fontFamily: 'monospace', color: Colors.white70, fontSize: 13, letterSpacing: 1)),
+                  ),
+                  IconButton(icon: const Icon(Icons.close_rounded, color: Colors.white54, size: 20), onPressed: onClose),
+                ],
+              ),
+            ),
+            Flexible(
+              child: !enabled
+                  ? const Padding(
+                padding: EdgeInsets.all(20),
+                child: Text('Chat is turned off by the host.',
+                    style: TextStyle(fontFamily: 'monospace', color: Colors.white38, fontSize: 12)),
+              )
+                  : ListView.builder(
+                shrinkWrap: true,
+                reverse: true,
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                itemCount: messages.length,
+                itemBuilder: (context, i) {
+                  final m = messages[messages.length - 1 - i];
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Align(
+                      alignment: m.isMe ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 260),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: m.isMe ? Colors.blueAccent.withValues(alpha: 0.25) : Colors.white.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (!m.isMe)
+                              Text(m.from, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white54)),
+                            Text(m.text, style: const TextStyle(fontFamily: 'monospace', fontSize: 13, color: Colors.white)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            if (enabled)
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: controller,
+                        style: const TextStyle(fontFamily: 'monospace', color: Colors.white, fontSize: 14),
+                        decoration: InputDecoration(
+                          hintText: 'Message the host…',
+                          hintStyle: const TextStyle(color: Colors.white38),
+                          isDense: true,
+                          filled: true,
+                          fillColor: Colors.white.withValues(alpha: 0.06),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                        ),
+                        onSubmitted: (_) => onSend(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton.filled(onPressed: onSend, icon: const Icon(Icons.send_rounded, size: 18)),
+                  ],
+                ),
+              ),
+          ],
         ),
       ),
     );

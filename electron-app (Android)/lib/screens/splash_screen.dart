@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import '../theme/app_themes.dart';
+import 'package:provider/provider.dart';
+import '../services/settings_service.dart';
 
 class SplashScreen extends StatefulWidget {
   final VoidCallback onFinished;
@@ -18,9 +19,11 @@ class _SplashScreenState extends State<SplashScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Splash always uses the Matrix theme accent, matching the screenshot,
-    // regardless of the user's saved theme (brand moment).
-    const accent = AppThemes.matrix;
+    // Matches whatever theme the user picked in Settings. main.dart wraps
+    // this screen in the same ChangeNotifierProvider<SettingsService> as
+    // the rest of the app, so this rebuilds the moment settings.load()
+    // resolves — no separate loading state needed here.
+    final accent = context.watch<SettingsService>().currentTheme;
 
     return Scaffold(
       backgroundColor: accent.background,

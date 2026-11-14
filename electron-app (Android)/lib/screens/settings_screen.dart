@@ -16,6 +16,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _hostController;
   late TextEditingController _screenPortController;
   late TextEditingController _controlPortController;
+  late TextEditingController _pairPortController;
 
   @override
   void initState() {
@@ -24,6 +25,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _hostController = TextEditingController(text: settings.defaultHost);
     _screenPortController = TextEditingController(text: '${settings.screenPort}');
     _controlPortController = TextEditingController(text: '${settings.controlPort}');
+    _pairPortController = TextEditingController(text: '${settings.pairPort}');
   }
 
   @override
@@ -31,6 +33,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _hostController.dispose();
     _screenPortController.dispose();
     _controlPortController.dispose();
+    _pairPortController.dispose();
     super.dispose();
   }
 
@@ -159,6 +162,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                           ],
                         ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const KickerLabel('Pairing Port'),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _pairPortController,
+                        keyboardType: TextInputType.number,
+                        style: const TextStyle(fontFamily: 'monospace', fontSize: 16),
+                        decoration: const InputDecoration(isDense: true),
+                        onChanged: (v) {
+                          final p = int.tryParse(v);
+                          if (p != null) settings.setPairPort(p);
+                        },
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Every new connection pairs here first (password + host Accept) before it gets a session token.',
+                        style: TextStyle(fontSize: 11, color: theme.textSecondary, fontFamily: 'monospace', height: 1.5),
                       ),
                     ],
                   ),

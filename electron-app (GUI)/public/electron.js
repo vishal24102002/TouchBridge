@@ -225,10 +225,10 @@ async function pickAndReadFileForChat() {
 // noticeably larger, so Ultra is best for reading/coding sessions rather
 // than fast-moving content.
 const QUALITY_PRESETS = {
-  low:    { format: 'image/jpeg', jpegQuality: 0.5 },
-  medium: { format: 'image/jpeg', jpegQuality: 0.75 },
-  high:   { format: 'image/jpeg', jpegQuality: 0.92 },
-  ultra:  { format: 'image/png' }, // lossless — no chroma subsampling, crisp text
+  low:    { format: 'image/jpeg', jpegQuality: 0.5,  maxWidth: 1280, fps: 30 },
+  medium: { format: 'image/jpeg', jpegQuality: 0.7,  maxWidth: 1600, fps: 30 },
+  high:   { format: 'image/jpeg', jpegQuality: 0.82, maxWidth: 1920, fps: 30 },
+  ultra:  { format: 'image/png',  maxWidth: 0,       fps: 10 }, // lossless, native size
 };
 
 // Bytes arriving over the wire (from our own capture pipeline, or relayed
@@ -466,20 +466,25 @@ ipcMain.handle('set-capture-quality', (_, quality) => {
 // Frames arrive here as an ArrayBuffer; frame it with a 4-byte big-endian
 // length prefix and write it straight to Python's stdin. server.py's
 // stdin_reader_thread() expects exactly this framing.
-let frameForwardCounter = 0;
+let lastPreviewAt = 0;
 ipcMain.on('frame-captured', (_event, arrayBuffer) => {
   if (!pythonProc || pythonProc.stdin.destroyed) return;
+  // If the pipe to Python is backed up, drop this frame instead of queueing
+  // it — a queued frame is a stale frame.
+  if (pythonProc.stdin.writableLength > 2 * 1024 * 1024) return;
   const jpegBuffer = Buffer.from(arrayBuffer);
   const header = Buffer.alloc(4);
   header.writeUInt32BE(jpegBuffer.length, 0);
-  pythonProc.stdin.write(Buffer.concat([header, jpegBuffer]));
+  pythonProc.stdin.cork();
+  pythonProc.stdin.write(header);
+  pythonProc.stdin.write(jpegBuffer);
+  pythonProc.stdin.uncork();
 
-  // Optional: forward an occasional frame to the main window so ServerPage
-  // can show a live local preview. Throttled to ~1 fps to stay cheap.
-  frameForwardCounter = (frameForwardCounter + 1) % 5;
-  if (frameForwardCounter === 0 && mainWindow) {
-    const dataUrl = `data:${sniffImageMime(jpegBuffer)};base64,` + jpegBuffer.toString('base64');
-    mainWindow.webContents.send('local-preview', dataUrl);
+  // Local preview for ServerPage, at most once a second.
+  const now = Date.now();
+  if (mainWindow && now - lastPreviewAt >= 1000) {
+    lastPreviewAt = now;
+    mainWindow.webContents.send('local-preview', `data:${sniffImageMime(jpegBuffer)};base64,` + jpegBuffer.toString('base64'));
   }
 });
 
@@ -676,39 +681,86 @@ ipcMain.handle('get-network', () => {
 // remote TouchBridge host. The connection is now TLS (fingerprint-pinned)
 // and every request must carry the session token issued by pair-connect —
 // without one, the host sends nothing back at all.
-ipcMain.handle('capture-screen', async (_, host, port, token) => {
+let screenStream = null; // { socket, pending, busy, stopped }
+
+function stopScreenStream() {
+  if (!screenStream) return;
+  screenStream.stopped = true;
+  screenStream.socket.destroy();
+  screenStream = null;
+}
+
+function flushScreenFrame(st) {
+  if (st.busy || !st.pending || !mainWindow) return;
+  const f = st.pending;
+  st.pending = null;
+  st.busy = true;
+  // Exact-size ArrayBuffer: structured clone would otherwise copy the whole
+  // backing buffer of a Buffer view.
+  const ab = f.buffer.slice(f.byteOffset, f.byteOffset + f.length);
+  mainWindow.webContents.send('screen-frame', ab, sniffImageMime(f));
+}
+
+// One persistent TLS connection; the host pushes [4-byte length][frame]
+// repeatedly. We keep ONLY the newest frame and hand it to the renderer when
+// it has finished drawing the previous one, so a slow UI drops frames instead
+// of building up lag.
+ipcMain.handle('screen-stream-start', async (_, host, port, token) => {
+  stopScreenStream();
   let socket;
   try {
     socket = await connectSecure(host, port || 8080, 20000);
   } catch (e) {
     return { ok: false, error: e.message };
   }
+  socket.setNoDelay(true);
+  const st = { socket, pending: null, busy: false, stopped: false };
+  screenStream = st;
+  socket.write(`stream:${token || ''}\n`);
 
   return new Promise((resolve) => {
-    const chunks = [];
-    let timeout;
+    let buf = Buffer.alloc(0);
+    let gotFirst = false;
+    const firstTimer = setTimeout(() => {
+      if (!gotFirst) { stopScreenStream(); resolve({ ok: false, error: 'timeout' }); }
+    }, 10000);
 
-    socket.write(`capture:${token || ''}\n`);
-    // Hard cap on total wait time — native-resolution frames are no
-    // longer downscaled, so this needs real headroom on slower links.
-    timeout = setTimeout(() => {
-      socket.destroy();
-      resolve({ ok: false, error: 'timeout' });
-    }, 20000);
-
-    socket.on('data', chunk => chunks.push(chunk));
-
-    socket.on('end', () => {
-      clearTimeout(timeout);
-      if (chunks.length === 0) { resolve({ ok: false, error: 'no_data' }); return; }
-      const buf = Buffer.concat(chunks);
-      resolve({ ok: true, dataUrl: `data:${sniffImageMime(buf)};base64,` + buf.toString('base64') });
+    socket.on('data', (chunk) => {
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      let off = 0, newest = null;
+      while (buf.length - off >= 4) {
+        const n = buf.readUInt32BE(off);
+        if (n > 64 * 1024 * 1024) { socket.destroy(); return; } // corrupt stream
+        if (buf.length - off - 4 < n) break;
+        if (n > 0) newest = buf.subarray(off + 4, off + 4 + n); // n === 0 is a keepalive
+        off += 4 + n;
+      }
+      if (off) buf = buf.subarray(off);
+      if (newest) {
+        st.pending = newest;
+        flushScreenFrame(st);
+        if (!gotFirst) { gotFirst = true; clearTimeout(firstTimer); resolve({ ok: true }); }
+      }
     });
 
-    socket.on('error', (e) => { clearTimeout(timeout); resolve({ ok: false, error: e.message }); });
-    socket.on('timeout', () => { socket.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    const finish = (reason) => {
+      clearTimeout(firstTimer);
+      if (!gotFirst) { gotFirst = true; resolve({ ok: false, error: reason }); }
+      if (screenStream === st) screenStream = null;
+      if (!st.stopped) mainWindow?.webContents.send('screen-stream-ended', reason);
+    };
+    socket.on('error', (e) => finish(e.message));
+    socket.on('close', () => finish('closed'));
   });
 });
+
+ipcMain.on('screen-frame-done', () => {
+  if (!screenStream) return;
+  screenStream.busy = false;
+  flushScreenFrame(screenStream);
+});
+
+ipcMain.handle('screen-stream-stop', () => { stopScreenStream(); return { ok: true }; });
 
 // ─── TCP Control Bridge ────────────────────────────────────────────────────
 // Control is granted per connected device (see server.py's ControlSession),
@@ -737,6 +789,7 @@ ipcMain.handle('control-connect', async (_, host, port, token) => {
     return { ok: false, error: e.message };
   }
   controlSocket = socket;
+  socket.setNoDelay(true);
   controlSocket.write(`AUTH:${token || ''}\n`);
 
   return new Promise((resolve) => {

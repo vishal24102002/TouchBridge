@@ -1,0 +1,71 @@
+#!/bin/bash
+# Wayland input helper using ydotool
+
+# Ensure ydotoold is running
+ensure_daemon() {
+    if ! pgrep -x "ydotoold" > /dev/null; then
+        ydotoold > /dev/null 2>&1 &
+        sleep 0.5
+    fi
+}
+
+case "$1" in
+    --test)
+        if command -v ydotool &> /dev/null; then
+            echo "OK"
+            exit 0
+        else
+            echo "ERROR: ydotool not found"
+            exit 1
+        fi
+        ;;
+    move)
+        if [ $# -eq 3 ]; then
+            ensure_daemon
+            ydotool mousemove --relative "$2" "$3" 2>/dev/null
+            exit 0
+        fi
+        ;;
+    click)
+        if [ $# -eq 2 ]; then
+            ensure_daemon
+            case "$2" in
+                1) ydotool click left 2>/dev/null ;;
+                3) ydotool click right 2>/dev/null ;;
+                *) exit 1 ;;
+            esac
+            exit 0
+        fi
+        ;;
+    doubleclick)
+        ensure_daemon
+        ydotool click left 2>/dev/null
+        sleep 0.05
+        ydotool click left 2>/dev/null
+        exit 0
+        ;;
+    key)
+        if [ $# -eq 2 ]; then
+            ensure_daemon
+            ydotool key "$2" 2>/dev/null
+            exit 0
+        fi
+        ;;
+    keys)
+        # For multiple keys
+        ensure_daemon
+        shift
+        ydotool key "$@" 2>/dev/null
+        exit 0
+        ;;
+    hotkey)
+        ensure_daemon
+        shift
+        ydotool key "$@" 2>/dev/null
+        exit 0
+        ;;
+    *)
+        echo "ERROR: Unknown command: $1"
+        exit 1
+        ;;
+esac
