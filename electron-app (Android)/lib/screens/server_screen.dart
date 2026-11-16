@@ -42,13 +42,30 @@ class _ServerScreenState extends State<ServerScreen> with WidgetsBindingObserver
   final _chatController = TextEditingController();
 
   bool _accessibilityEnabled = false;
+  late SettingsService _settings;
+  late String _appliedCodec;
+  late VoidCallback _settingsListener;
   bool _overlayGranted = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _server = HostServerService(frameProvider: ScreenCaptureChannel.getLatestFrame);
+    _server = HostServerService(
+      videoFrames: ScreenCaptureChannel.videoFrames, // H.264 or JPEG frames, pushed as produced
+      requestKeyframe: ScreenCaptureChannel.requestKeyframe,
+      audioFrames: ScreenCaptureChannel.audioFrames, // shared sound, if enabled in Settings
+    );
+    // Apply a codec change from Settings to a running session right away.
+    final settings = _settings = context.read<SettingsService>();
+    _appliedCodec = settings.videoCodec;
+    _settingsListener = () {
+      if (_running && settings.videoCodec != _appliedCodec) {
+        _appliedCodec = settings.videoCodec;
+        ScreenCaptureChannel.setCodec(_appliedCodec);
+      }
+    };
+    settings.addListener(_settingsListener);
     _server.init().then((_) {
       final info = _server.deviceInfo();
       if (mounted) setState(() {
@@ -130,7 +147,8 @@ class _ServerScreenState extends State<ServerScreen> with WidgetsBindingObserver
       }
       return;
     }
-    await ScreenCaptureChannel.startCapture();
+    _appliedCodec = settings.videoCodec;
+    await ScreenCaptureChannel.startCapture(codec: _appliedCodec, audio: settings.audioSource);
 
     try {
       await _server.start(
@@ -189,6 +207,7 @@ class _ServerScreenState extends State<ServerScreen> with WidgetsBindingObserver
 
   @override
   void dispose() {
+    _settings.removeListener(_settingsListener);
     WidgetsBinding.instance.removeObserver(this);
     _server.dispose();
     if (_running) ScreenCaptureChannel.stopCapture();
@@ -984,7 +1003,7 @@ class _ChatSheet extends StatelessWidget {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             if (!m.isMe)
-                              Text(m.from,
+                              Text(m.hostOnly ? '${m.from} · 🔒 to you only' : '${m.from} · to everyone',
                                   style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: scheme.primary)),
                             Text(m.text, style: const TextStyle(fontFamily: 'monospace', fontSize: 13)),
                           ],

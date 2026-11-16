@@ -386,5 +386,10 @@ class ChatMessage {
   final String text;
   final DateTime time;
   final bool isMe;
-  ChatMessage({required this.from, required this.text, required this.time, this.isMe = false});
+
+  /// Sent to the host only (never relayed to the other devices). On the
+  /// host side: "this device wrote to me privately". On a viewer: "I sent
+  /// this to the host only".
+  final bool hostOnly;
+  ChatMessage({required this.from, required this.text, required this.time, this.isMe = false, this.hostOnly = false});
 }

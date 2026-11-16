@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import '../services/screen_capture_channel.dart';
 import '../services/settings_service.dart';
 import '../theme/app_themes.dart';
 import '../widgets/common.dart';
@@ -187,6 +188,99 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         style: TextStyle(fontSize: 11, color: theme.textSecondary, fontFamily: 'monospace', height: 1.5),
                       ),
                     ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 32),
+
+            const SectionHeader(emoji: '🎞️', title: 'Video Codec'),
+            const SizedBox(height: 16),
+            OutlinedPanel(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(value: 'h264', label: Text('H.264')),
+                        ButtonSegment(value: 'jpeg', label: Text('JPEG')),
+                      ],
+                      selected: {settings.videoCodec},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (v) => settings.setVideoCodec(v.first),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Used when this device shares its screen. H.264 (default) is much smoother '
+                    'and lighter on the network; JPEG sends every frame as a picture and is the '
+                    'compatibility choice. Applies immediately, even mid-session. Watching a '
+                    'remote screen needs no setting — either codec is detected automatically. '
+                    'If this phone has no usable H.264 encoder it falls back to JPEG by itself.',
+                    style: TextStyle(fontSize: 11, color: theme.textSecondary, fontFamily: 'monospace', height: 1.5),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 32),
+
+            const SectionHeader(emoji: '🔊', title: 'Audio'),
+            const SizedBox(height: 16),
+            OutlinedPanel(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Share sound from this phone (when it hosts)',
+                    style: TextStyle(fontSize: 12, color: theme.textSecondary),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(value: 'off', label: Text('Off')),
+                        ButtonSegment(value: 'system', label: Text('System')),
+                        ButtonSegment(value: 'mic', label: Text('Mic')),
+                      ],
+                      selected: {settings.audioSource},
+                      showSelectedIcon: false,
+                      onSelectionChanged: (v) async {
+                        final source = v.first;
+                        // Asks for the record-audio permission when needed.
+                        final ok = await ScreenCaptureChannel.setAudioSource(source);
+                        if (ok) {
+                          await settings.setAudioSource(source);
+                        } else if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(source == 'system'
+                                  ? 'System sound needs Android 10+ and the microphone permission'
+                                  : 'Audio needs the microphone permission'),
+                            ),
+                          );
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(
+                      "Play the host's audio when viewing",
+                      style: TextStyle(fontSize: 13, color: theme.textPrimary),
+                    ),
+                    value: settings.playRemoteAudio,
+                    onChanged: (v) => settings.setPlayRemoteAudio(v),
+                  ),
+                  Text(
+                    'Off by default. "System" shares what this phone plays (Android 10+; apps that '
+                    'block capture stay silent), "Mic" shares the microphone. Audio goes to every '
+                    'connected viewer, applies immediately even mid-session, and viewers can mute '
+                    'it from the toolbar.',
+                    style: TextStyle(fontSize: 11, color: theme.textSecondary, fontFamily: 'monospace', height: 1.5),
                   ),
                 ],
               ),

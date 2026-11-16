@@ -9,6 +9,7 @@ from typing import Optional
 from .base import CapabilityTier, InputBackend
 from .pyautogui import PyAutoGuiBackend
 from .helper import LinuxInputHelperBackend
+from .uinput import UInputBackend
 from .win32 import Win32Backend
 from .utils import detect_display_server, detect_wayland_compositor
 
@@ -21,44 +22,50 @@ def get_backend() -> InputBackend:
     system = platform.system().lower()
     display_server = detect_display_server()
     
-    # Windows: try native Win32 backend first
+    # Windows: pyautogui (SendInput under the hood). The native Win32 backend
+    # is kept only as a fallback if pyautogui isn't installed.
     if system == "windows":
-        try:
-            backend = Win32Backend()
+        backend = PyAutoGuiBackend(display_server="windows")
+        if backend.capability_tier != CapabilityTier.NONE:
             return backend
+        try:
+            return Win32Backend()
         except Exception as e:
-            print(f"[WARN] Win32 backend failed: {e}, falling back to pyautogui", flush=True)
-            return PyAutoGuiBackend(display_server="windows")
-    
+            print(f"[WARN] Win32 backend failed: {e}", flush=True)
+            return backend
+
     # macOS: pyautogui + Accessibility permissions
     if system == "darwin":
         return PyAutoGuiBackend(display_server="darwin")
     
-    # Linux: detect X11 vs Wayland
+    # Linux priority: 1) evdev (/dev/uinput)  2) pyautogui (X11/XTest)
+    #                 3) native helpers (X11 helper / ydotool)  4) none
     if system == "linux":
+        # 1) evdev/uinput: the compositor sees a real keyboard/mouse, so chords
+        #    (Ctrl+C, Alt+Tab, Win+D...) and the Super key behave like hardware.
+        #    Works on X11 and Wayland.
+        try:
+            return UInputBackend(display_server=display_server)
+        except Exception as e:
+            print(f"[WARN] evdev/uinput backend unavailable: {e}", flush=True)
+
+        # 2) pyautogui: only useful on X11 (Wayland has no XTest).
         if display_server == "x11":
-            # Try native input helper first (works at login screen)
-            try:
-                backend = LinuxInputHelperBackend()
+            backend = PyAutoGuiBackend(display_server="x11")
+            if backend.capability_tier != CapabilityTier.NONE:
                 return backend
-            except Exception as e:
-                print(f"[WARN] Linux helper failed: {e}, falling back to pyautogui (XTest)", flush=True)
-                return PyAutoGuiBackend(display_server="x11")
-        
-        elif display_server == "wayland":
-            # Wayland: try portal/libei if available
+            print("[WARN] pyautogui unavailable on X11", flush=True)
+
+        # 3) Last-resort helpers (X11 XTest helper, or ydotool on Wayland).
+        if display_server in ("x11", "wayland"):
             try:
-                backend = LinuxInputHelperBackend()
-                return backend
+                return LinuxInputHelperBackend()
             except Exception as e:
-                print(f"[WARN] Linux helper failed on Wayland: {e}", flush=True)
-                # No Wayland-capable backend available
-                return _LimitedLinuxBackend(display_server="wayland")
-        
-        else:
-            # Unknown display server - fall back to limited
-            return _LimitedLinuxBackend(display_server="unknown")
-    
+                print(f"[WARN] Linux helper unavailable: {e}", flush=True)
+
+        # 4) Nothing worked.
+        return _LimitedLinuxBackend(display_server=display_server or "unknown")
+
     # Fallback for unknown platforms
     return PyAutoGuiBackend(display_server="unknown")
 
@@ -67,13 +74,13 @@ class _LimitedLinuxBackend(InputBackend):
     """Minimal backend for Linux when no input control is possible."""
     
     capability_tier = CapabilityTier.NONE
-    capability_description = "No input control available on Wayland — install input helper"
+    capability_description = "No input control on Wayland — run setup_uinput.sh, then log out and back in"
     display_server: Optional[str] = None
     
     def __init__(self, display_server: Optional[str] = None):
         self.display_server = display_server
         if display_server == "wayland":
-            self.capability_description = "No input control available on Wayland — install input helper"
+            self.capability_description = "No input control on Wayland — run setup_uinput.sh, then log out and back in"
         else:
             self.capability_description = "No input control available — unknown display server"
     

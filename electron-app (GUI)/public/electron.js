@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, desktopCapturer, screen, Tray, Menu, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, desktopCapturer, screen, Tray, Menu, nativeImage, dialog, systemPreferences } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -195,7 +195,7 @@ function saveReceivedFile(fileNameB64, fileDataB64) {
 // 'file:<name_b64>:<data_b64>' command ready to hand to either adminRequest
 // (host sending) or controlSocket.write (client sending) — both send sides
 // share this instead of duplicating the pick/read/encode/size-check steps.
-async function pickAndReadFileForChat() {
+async function pickAndReadFileForChat(command = 'file') {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: 'Select a file to send',
     properties: ['openFile'],
@@ -208,13 +208,15 @@ async function pickAndReadFileForChat() {
   }
   const fileName = path.basename(filePath);
   const data = fs.readFileSync(filePath);
-  const cmd = `file:${Buffer.from(fileName).toString('base64')}:${data.toString('base64')}`;
+  const cmd = `${command}:${Buffer.from(fileName).toString('base64')}:${data.toString('base64')}`;
   return { canceled: false, fileName, cmd };
 }
 
-// Screen-capture quality presets, selectable from Settings. Low/Medium/High
-// stay JPEG (smaller frames, good for photos/video-like content) at
-// increasing quality. Ultra switches to PNG — fully LOSSLESS.
+// Screen-capture quality presets, selectable from Settings, combined with the
+// video codec (also a Setting — 'h264' by default, or 'jpeg').
+//
+// JPEG codec: Low/Medium/High are JPEG at increasing quality (smaller frames,
+// good for photos/video-like content). Ultra switches to PNG — fully LOSSLESS.
 //
 // Why: JPEG's compressor uses chroma subsampling (it throws away color
 // detail around edges to save space). That's invisible on photos but is
@@ -224,12 +226,62 @@ async function pickAndReadFileForChat() {
 // step, so at Ultra, text renders pixel-perfect. Trade-off: PNG frames are
 // noticeably larger, so Ultra is best for reading/coding sessions rather
 // than fast-moving content.
+//
+// H.264 codec: the same four presets pick resolution and bitrate instead.
+// Inter-frame compression makes frames tiny compared with per-frame JPEG, so
+// every preset can run at 30 fps; Ultra is native resolution at a high
+// bitrate (near-transparent, but not bit-exact like PNG).
 const QUALITY_PRESETS = {
   low:    { format: 'image/jpeg', jpegQuality: 0.5,  maxWidth: 1280, fps: 30 },
   medium: { format: 'image/jpeg', jpegQuality: 0.7,  maxWidth: 1600, fps: 30 },
   high:   { format: 'image/jpeg', jpegQuality: 0.82, maxWidth: 1920, fps: 30 },
   ultra:  { format: 'image/png',  maxWidth: 0,       fps: 10 }, // lossless, native size
 };
+const H264_PRESETS = {
+  low:    { maxWidth: 1280, fps: 30, bitrate: 2500000 },
+  medium: { maxWidth: 1600, fps: 30, bitrate: 5000000 },
+  high:   { maxWidth: 1920, fps: 30, bitrate: 8000000 },
+  ultra:  { maxWidth: 0,    fps: 30, bitrate: 20000000 },
+};
+const VIDEO_CODECS = ['h264', 'jpeg'];
+const DEFAULT_VIDEO_CODEC = 'h264';
+
+function currentVideoCodec() {
+  const c = store.get('videoCodec', DEFAULT_VIDEO_CODEC);
+  return VIDEO_CODECS.includes(c) ? c : DEFAULT_VIDEO_CODEC;
+}
+
+// Audio sharing: 'off' (default) | 'mic' | 'system'. Chosen in Settings.
+const AUDIO_SOURCES = ['off', 'mic', 'system'];
+function currentAudioSource() {
+  const a = store.get('audioSource', 'off');
+  return AUDIO_SOURCES.includes(a) ? a : 'off';
+}
+
+// Everything the capture window needs, for the current quality + codec.
+function buildCaptureConfig() {
+  const stored = store.get('captureQuality', 'high');
+  const quality = QUALITY_PRESETS[stored] ? stored : 'high';
+  const codec = currentVideoCodec();
+  const extra = { audioSource: currentAudioSource(), platform: process.platform };
+  if (codec === 'jpeg') return { ...QUALITY_PRESETS[quality], codec, ...extra };
+  // H.264: resolution/fps/bitrate come from H264_PRESETS. The JPEG fields stay
+  // in the object so the capture window can fall back to plain JPEG on a
+  // machine without an H.264 encoder (see capture-renderer.js).
+  return { ...QUALITY_PRESETS[quality], ...H264_PRESETS[quality], codec, ...extra };
+}
+
+// H.264 frames arrive as "TBH4" + flag byte + Annex-B data (see
+// capture-window/h264-encoder.js); images are plain JPEG/PNG bytes.
+function isH264Payload(buf) {
+  return buf.length > 5 && buf[0] === 0x54 && buf[1] === 0x42 && buf[2] === 0x48 && buf[3] === 0x34;
+}
+function isAudioPayload(buf) {
+  return buf.length > 9 && buf[0] === 0x54 && buf[1] === 0x42 && buf[2] === 0x41 && buf[3] === 0x31;
+}
+function isH264Keyframe(buf) {
+  return isH264Payload(buf) && (buf[4] & 1) === 1;
+}
 
 // Bytes arriving over the wire (from our own capture pipeline, or relayed
 // by server.py) can now be either JPEG or PNG depending on the active
@@ -246,9 +298,75 @@ function sniffImageMime(buf) {
 // ─── Spawn Python Server ──────────────────────────────────────────────────────
 // Python no longer captures the screen itself — Electron does that (see
 // createCaptureWindow / the 'frame-captured' IPC handler below) and pipes
-// JPEG frames to this process's stdin. Python just relays them to remote
+// encoded frames (H.264 or JPEG) to this process's stdin. Python just relays them to remote
 // TCP clients on the screen port, and still handles the control port itself.
-function startPythonServer() {
+// Private virtualenv for the Python server, kept in the app's data folder so it
+// works for dev AND packaged builds (the packaged resources dir is read-only).
+// First run: create it and `pip install -r requirements.txt`. Later runs: reuse
+// it, re-installing only if requirements.txt changed. Set TOUCHBRIDGE_PYTHON to
+// bypass this and use a specific interpreter instead.
+let pythonStartToken = 0; // bumped on every start/stop so a stale async start can bail out
+
+function serverLog(msg) {
+  console.log('[PY]', msg);
+  mainWindow?.webContents.send('server-log', msg);
+}
+
+// Run a command, streaming its output lines into the server log. Resolves with the exit code.
+function runLogged(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    let proc;
+    try { proc = spawn(cmd, args, opts); }
+    catch (e) { serverLog(`[ERR] could not run ${cmd}: ${e.message}`); return resolve(-1); }
+    const pipe = (stream) => stream.on('data', (d) =>
+      d.toString().split(/\r?\n/).filter(Boolean).forEach((l) => serverLog(`[setup] ${l}`)));
+    pipe(proc.stdout); pipe(proc.stderr);
+    proc.on('error', (e) => { serverLog(`[ERR] ${cmd}: ${e.message}`); resolve(-1); });
+    proc.on('close', (code) => resolve(code));
+  });
+}
+
+async function ensurePythonEnv(serverDir) {
+  if (process.env.TOUCHBRIDGE_PYTHON) return process.env.TOUCHBRIDGE_PYTHON;
+
+  const isWin = process.platform === 'win32';
+  const systemPython = isWin ? 'python' : 'python3';
+  const venvDir = path.join(app.getPath('userData'), 'python-venv');
+  const venvPy = path.join(venvDir, isWin ? 'Scripts' : 'bin', isWin ? 'python.exe' : 'python3');
+
+  if (!fs.existsSync(venvPy)) {
+    serverLog('[setup] Creating Python environment (first run only)...');
+    const code = await runLogged(systemPython, ['-m', 'venv', venvDir]);
+    if (code !== 0 || !fs.existsSync(venvPy)) {
+      serverLog(`[ERR] Could not create the Python environment with '${systemPython}'. ` +
+        (isWin ? 'Install Python 3 from python.org.' : 'Try: sudo apt install python3 python3-venv'));
+      return systemPython; // last resort: system Python
+    }
+  }
+
+  const reqFile = path.join(serverDir, 'requirements.txt');
+  if (fs.existsSync(reqFile)) {
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(reqFile)).digest('hex');
+    const stampFile = path.join(venvDir, '.requirements-hash');
+    const installed = fs.existsSync(stampFile) ? fs.readFileSync(stampFile, 'utf8').trim() : '';
+    if (installed !== hash) {
+      serverLog('[setup] Installing Python requirements (this can take a minute)...');
+      const code = await runLogged(venvPy, ['-m', 'pip', 'install', '-r', reqFile]);
+      if (code === 0) {
+        fs.writeFileSync(stampFile, hash);
+        serverLog('[setup] Python requirements installed.');
+      } else {
+        serverLog('[ERR] pip install failed — see [setup] lines above. ' +
+          (isWin ? '' : 'evdev needs: sudo apt install python3-dev build-essential. ') +
+          'Starting the server anyway.');
+      }
+    }
+  }
+  return venvPy;
+}
+
+async function startPythonServer() {
+  const myToken = ++pythonStartToken;
   const serverDir = isDev
     ? path.join(__dirname, '../../python-server')
     : path.join(process.resourcesPath, 'python-server');
@@ -259,7 +377,10 @@ function startPythonServer() {
     return;
   }
 
-  const bin = process.platform === 'win32' ? 'python' : 'python3';
+  const bin = await ensurePythonEnv(serverDir);
+  // Stopped (or restarted) while we were setting up — don't spawn a stale server.
+  if (myToken !== pythonStartToken || !serverRunning) return;
+  console.log('[PY] using interpreter:', bin);
   const args = [
     script,
     '--admin-port', String(ADMIN_PORT),
@@ -325,7 +446,7 @@ function startPythonServer() {
           if (msg.fileNameB64) {
             const saved = saveReceivedFile(msg.fileNameB64, msg.fileDataB64);
             mainWindow?.webContents.send('chat-message', {
-              from: msg.from, time: msg.time, source: msg.source,
+              from: msg.from, time: msg.time, source: msg.source, scope: msg.scope,
               fileName: saved?.fileName || '(file)', savedPath: saved?.savedPath,
             });
           } else {
@@ -367,7 +488,7 @@ function startPythonServer() {
 // ─── Hidden Capture Window ─────────────────────────────────────────────────────
 // A BrowserWindow that's never shown. Its renderer (capture-window/*) calls
 // getUserMedia against a desktopCapturer source, draws frames to a canvas,
-// and forwards JPEG bytes back to us via the 'frame-captured' IPC message.
+// and forwards encoded frames (H.264 or JPEG) back to us via the 'frame-captured' IPC message.
 //
 // desktopCapturer + getUserMedia captures the FULL SCREEN (every window,
 // including ones that aren't TouchBridge), regardless of whether the main
@@ -385,6 +506,7 @@ function createCaptureWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false,
+      autoplayPolicy: 'no-user-gesture-required', // the capture window's AudioContext must start without a click
     },
   });
   captureWindow.loadFile(path.join(__dirname, 'capture-window', 'index.html'));
@@ -399,8 +521,12 @@ function createCaptureWindow() {
 // Both are idempotent, so accidental double-calls are harmless.
 ipcMain.handle('start-server', () => {
   if (serverRunning) return { ok: true, alreadyRunning: true };
+  waitingForKeyframe = false;
+  activeCaptureCodec = null;
   startPythonServer();
   createCaptureWindow();
+  syncLinuxSystemAudio();
+  requestMicAccessIfNeeded();
   serverRunning = true;
   return { ok: true };
 });
@@ -415,8 +541,10 @@ function stopServer() {
   // the whole renderer (getUserMedia stream, canvas, the capture loop's
   // setTimeout chain — everything), so there's no separate "stop capturing"
   // message needed. Nothing left running means nothing left to send.
+  stopLinuxSystemAudio();
   captureWindow?.close();
   captureWindow = null;
+  pythonStartToken++; // cancel any start still busy setting up the Python env
   pythonProc?.kill();
   pythonProc = null;
   serverRunning = false;
@@ -449,43 +577,213 @@ ipcMain.handle('get-screen-resolution', () => {
   };
 });
 
-// Screen-capture quality (Low/Medium/High), read by the capture window on
-// startup and pushed live on change so it applies without a restart.
-ipcMain.handle('get-capture-config', () => {
-  const quality = store.get('captureQuality', 'high');
-  return QUALITY_PRESETS[quality] ?? QUALITY_PRESETS.high;
-});
+// Screen-capture quality + codec, read by the capture window on startup and
+// pushed live on change so it applies without a restart.
+ipcMain.handle('get-capture-config', () => buildCaptureConfig());
 
 ipcMain.handle('set-capture-quality', (_, quality) => {
   if (!QUALITY_PRESETS[quality]) return { ok: false, error: 'Unknown quality preset' };
   store.set('captureQuality', quality);
-  captureWindow?.webContents.send('capture-config-updated', QUALITY_PRESETS[quality]);
+  captureWindow?.webContents.send('capture-config-updated', buildCaptureConfig());
   return { ok: true };
+});
+
+// Video codec: 'h264' (default) or 'jpeg'. Switching mid-session is seamless —
+// every frame is self-describing, so viewers just follow along.
+ipcMain.handle('get-video-codec', () => ({ codec: currentVideoCodec(), active: activeCaptureCodec }));
+ipcMain.handle('set-video-codec', (_, codec) => {
+  if (!VIDEO_CODECS.includes(codec)) return { ok: false, error: 'Unknown video codec' };
+  store.set('videoCodec', codec);
+  captureWindow?.webContents.send('capture-config-updated', buildCaptureConfig());
+  return { ok: true };
+});
+
+// What the capture window is really producing (differs from the setting when
+// H.264 isn't available on this machine and it fell back to JPEG).
+let activeCaptureCodec = null;
+ipcMain.on('capture-codec', (_event, codec) => {
+  activeCaptureCodec = codec;
+  const note = codec === 'h264' ? 'Streaming H.264' : (currentVideoCodec() === 'h264' ? 'Streaming JPEG (H.264 unavailable here)' : 'Streaming JPEG');
+  mainWindow?.webContents.send('server-log', note);
+  mainWindow?.webContents.send('capture-codec', codec);
 });
 
 // Frames arrive here as an ArrayBuffer; frame it with a 4-byte big-endian
 // length prefix and write it straight to Python's stdin. server.py's
 // stdin_reader_thread() expects exactly this framing.
 let lastPreviewAt = 0;
+// After dropping an H.264 frame we must also drop everything up to the next
+// keyframe — a delta frame whose predecessor is missing corrupts the picture
+// for every viewer. (Images are independent, so a dropped image is harmless.)
+let waitingForKeyframe = false;
 ipcMain.on('frame-captured', (_event, arrayBuffer) => {
   if (!pythonProc || pythonProc.stdin.destroyed) return;
+  const payload = Buffer.from(arrayBuffer);
+  const h264 = isH264Payload(payload);
+  const key = h264 && isH264Keyframe(payload);
+
   // If the pipe to Python is backed up, drop this frame instead of queueing
   // it — a queued frame is a stale frame.
-  if (pythonProc.stdin.writableLength > 2 * 1024 * 1024) return;
-  const jpegBuffer = Buffer.from(arrayBuffer);
+  const backedUp = pythonProc.stdin.writableLength > 2 * 1024 * 1024;
+  if (backedUp) {
+    if (h264) {
+      waitingForKeyframe = true;
+      captureWindow?.webContents.send('force-keyframe');
+    }
+    return;
+  }
+  if (h264) {
+    if (waitingForKeyframe && !key) return;
+    if (key) waitingForKeyframe = false;
+  }
+
   const header = Buffer.alloc(4);
-  header.writeUInt32BE(jpegBuffer.length, 0);
+  header.writeUInt32BE(payload.length, 0);
   pythonProc.stdin.cork();
   pythonProc.stdin.write(header);
-  pythonProc.stdin.write(jpegBuffer);
+  pythonProc.stdin.write(payload);
   pythonProc.stdin.uncork();
 
-  // Local preview for ServerPage, at most once a second.
-  const now = Date.now();
-  if (mainWindow && now - lastPreviewAt >= 1000) {
-    lastPreviewAt = now;
-    mainWindow.webContents.send('local-preview', `data:${sniffImageMime(jpegBuffer)};base64,` + jpegBuffer.toString('base64'));
+  // Local preview for ServerPage, at most once a second. (H.264 can't be
+  // shown in an <img>; the capture window sends a separate thumbnail then —
+  // see 'preview-captured'.)
+  if (!h264) {
+    const now = Date.now();
+    if (mainWindow && now - lastPreviewAt >= 1000) {
+      lastPreviewAt = now;
+      mainWindow.webContents.send('local-preview', `data:${sniffImageMime(payload)};base64,` + payload.toString('base64'));
+    }
   }
+});
+
+ipcMain.on('preview-captured', (_event, arrayBuffer) => {
+  if (!mainWindow) return;
+  mainWindow.webContents.send('local-preview', 'data:image/jpeg;base64,' + Buffer.from(arrayBuffer).toString('base64'));
+});
+
+// ─── Audio sharing (host → viewers) ──────────────────────────────────────────
+// Audio chunks ("TBA1" + channels + rate + PCM16, see capture-window/audio-capture.js)
+// are written to the Python relay's stdin with the same length-prefix framing
+// as video. The relay keeps them in a separate lane so audio never disturbs
+// video, and fans them out to every viewer.
+function writeAudioToPython(payload) {
+  if (!pythonProc || pythonProc.stdin.destroyed) return;
+  // Only drop audio if the pipe is badly backed up — and well after video
+  // would be dropped (2 MB), otherwise a busy video stream starves the audio
+  // and it stutters. Audio is tiny (~48 KB/s), so it can ride along.
+  if (pythonProc.stdin.writableLength > 6 * 1024 * 1024) return;
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(payload.length, 0);
+  pythonProc.stdin.cork();
+  pythonProc.stdin.write(header);
+  pythonProc.stdin.write(payload);
+  pythonProc.stdin.uncork();
+}
+
+ipcMain.on('audio-captured', (_event, arrayBuffer) => {
+  if (currentAudioSource() === 'off') return;
+  writeAudioToPython(Buffer.from(arrayBuffer));
+});
+
+// macOS asks for microphone permission once; without it the mic is silent.
+function requestMicAccessIfNeeded() {
+  if (process.platform === 'darwin' && currentAudioSource() === 'mic'
+      && systemPreferences.getMediaAccessStatus('microphone') !== 'granted') {
+    systemPreferences.askForMediaAccess('microphone').catch(() => {});
+  }
+}
+
+// Linux system sound: Chromium can't loop back the desktop mix on Linux, so
+// record the default output's monitor with PulseAudio/PipeWire's `parec`.
+let parecProc = null;
+let parecRetries = 0;
+const LINUX_AUDIO_RATE = 24000;
+const LINUX_AUDIO_CHUNK = LINUX_AUDIO_RATE * 2 * 0.04; // 40 ms of mono PCM16
+
+function audioLog(msg) { mainWindow?.webContents.send('server-log', msg); }
+
+function stopLinuxSystemAudio() {
+  parecRetries = 0;
+  if (!parecProc) return;
+  const p = parecProc;
+  parecProc = null;
+  try { p.kill(); } catch (_) { /* already gone */ }
+}
+
+function syncLinuxSystemAudio() {
+  const want = process.platform === 'linux' && serverRunningOrStarting() && currentAudioSource() === 'system';
+  if (!want) { stopLinuxSystemAudio(); return; }
+  if (parecProc) return;
+
+  let proc;
+  try {
+    proc = spawn('parec', [
+      '-d', '@DEFAULT_MONITOR@', '--format=s16le', `--rate=${LINUX_AUDIO_RATE}`,
+      '--channels=1', '--latency-msec=40',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    audioLog(`[ERR] Could not start system-audio capture: ${e.message}`);
+    return;
+  }
+  parecProc = proc;
+  let acc = Buffer.alloc(0);
+  let gotBytes = false, gotSound = false, lastErr = '';
+  proc.stderr.on('data', (d) => { lastErr = d.toString().trim().split('\n').pop(); });
+  // Diagnostics: say what is (not) happening instead of staying silent.
+  const diag = setTimeout(() => {
+    if (parecProc !== proc) return;
+    if (!gotBytes) audioLog(`[ERR] parec is running but delivers no data${lastErr ? ` (${lastErr})` : ''} — is PulseAudio/PipeWire running?`);
+    else if (!gotSound) audioLog('System audio is capturing but silent — nothing is playing on the default output device.');
+  }, 5000);
+  proc.stdout.on('data', (d) => {
+    gotBytes = true;
+    acc = acc.length ? Buffer.concat([acc, d]) : d;
+    while (acc.length >= LINUX_AUDIO_CHUNK) {
+      const pcm = acc.subarray(0, LINUX_AUDIO_CHUNK);
+      acc = acc.subarray(LINUX_AUDIO_CHUNK);
+      let peak = 0;
+      for (let i = 0; i + 1 < pcm.length; i += 2) {
+        const v = Math.abs(pcm.readInt16LE(i));
+        if (v > peak) peak = v;
+      }
+      if (peak === 0) continue; // silence
+      if (!gotSound) { gotSound = true; parecRetries = 0; audioLog('System audio is being captured and sent'); }
+      const out = Buffer.alloc(9 + pcm.length);
+      out.write('TBA1', 0, 'latin1');
+      out[4] = 1;
+      out.writeUInt32BE(LINUX_AUDIO_RATE, 5);
+      pcm.copy(out, 9);
+      writeAudioToPython(out);
+    }
+  });
+  proc.on('error', (e) => {
+    clearTimeout(diag);
+    if (parecProc === proc) parecProc = null;
+    audioLog(e.code === 'ENOENT'
+      ? '[ERR] System-audio sharing needs `parec` (install pulseaudio-utils or pipewire-pulse).'
+      : `[ERR] System-audio capture failed: ${e.message}`);
+  });
+  proc.on('close', (code) => {
+    clearTimeout(diag);
+    if (parecProc !== proc) return; // stopped on purpose
+    parecProc = null;
+    audioLog(`[ERR] parec exited (code ${code})${lastErr ? `: ${lastErr}` : ''}`);
+    // Sound-server restarts / device changes end parec — try again a few times.
+    if (parecRetries++ < 5) setTimeout(syncLinuxSystemAudio, 2000);
+  });
+  audioLog('Audio sharing started (system sound)');
+}
+
+function serverRunningOrStarting() { return !!pythonProc && !!captureWindow; }
+
+ipcMain.handle('get-audio-source', () => ({ source: currentAudioSource(), platform: process.platform }));
+ipcMain.handle('set-audio-source', (_, source) => {
+  if (!AUDIO_SOURCES.includes(source)) return { ok: false, error: 'Unknown audio source' };
+  store.set('audioSource', source);
+  captureWindow?.webContents.send('capture-config-updated', buildCaptureConfig());
+  syncLinuxSystemAudio();
+  requestMicAccessIfNeeded();
+  return { ok: true };
 });
 
 ipcMain.on('capture-error', (_event, message) => {
@@ -702,9 +1000,12 @@ function flushScreenFrame(st) {
 }
 
 // One persistent TLS connection; the host pushes [4-byte length][frame]
-// repeatedly. We keep ONLY the newest frame and hand it to the renderer when
-// it has finished drawing the previous one, so a slow UI drops frames instead
-// of building up lag.
+// repeatedly. Image frames (JPEG/PNG): we keep ONLY the newest and hand it to
+// the renderer when it has finished drawing the previous one, so a slow UI
+// drops frames instead of building up lag. H.264 frames can't be dropped
+// individually (every delta frame depends on the one before it), so they are
+// forwarded in order, immediately — the renderer's decoder (see
+// src/h264Player.js) owns the catch-up policy.
 ipcMain.handle('screen-stream-start', async (_, host, port, token) => {
   stopScreenStream();
   let socket;
@@ -727,20 +1028,36 @@ ipcMain.handle('screen-stream-start', async (_, host, port, token) => {
 
     socket.on('data', (chunk) => {
       buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
-      let off = 0, newest = null;
+      let off = 0, newestImage = null, gotFrame = false;
       while (buf.length - off >= 4) {
         const n = buf.readUInt32BE(off);
         if (n > 64 * 1024 * 1024) { socket.destroy(); return; } // corrupt stream
         if (buf.length - off - 4 < n) break;
-        if (n > 0) newest = buf.subarray(off + 4, off + 4 + n); // n === 0 is a keepalive
+        if (n > 0) { // n === 0 is a keepalive
+          const frame = buf.subarray(off + 4, off + 4 + n);
+          if (isAudioPayload(frame)) {
+            if (mainWindow) {
+              const ab = frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
+              mainWindow.webContents.send('screen-audio', ab);
+            }
+          } else if (isH264Payload(frame)) {
+            if (mainWindow) {
+              const ab = frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
+              mainWindow.webContents.send('screen-frame', ab, 'video/h264');
+            }
+          } else {
+            newestImage = frame;
+          }
+          gotFrame = true;
+        }
         off += 4 + n;
       }
       if (off) buf = buf.subarray(off);
-      if (newest) {
-        st.pending = newest;
+      if (newestImage) {
+        st.pending = newestImage;
         flushScreenFrame(st);
-        if (!gotFirst) { gotFirst = true; clearTimeout(firstTimer); resolve({ ok: true }); }
       }
+      if (gotFrame && !gotFirst) { gotFirst = true; clearTimeout(firstTimer); resolve({ ok: true }); }
     });
 
     const finish = (reason) => {
@@ -910,9 +1227,10 @@ ipcMain.handle('control-send', async (_, cmd) => {
 
 // Client-side "send a file to the host" — opens the picker, then reuses
 // the same control socket chat rides on. See pickAndReadFileForChat.
-ipcMain.handle('send-client-file', async () => {
+// target: 'all' (default — host and every other device) or 'host' (host only).
+ipcMain.handle('send-client-file', async (_, target) => {
   if (!controlSocket || controlSocket.destroyed) return { ok: false, error: 'Not connected' };
-  const picked = await pickAndReadFileForChat();
+  const picked = await pickAndReadFileForChat(target === 'host' ? 'file-host' : 'file');
   if (picked.canceled) return { ok: false, canceled: true };
   if (picked.error) return { ok: false, error: picked.error };
   return new Promise((resolve) => {

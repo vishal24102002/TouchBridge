@@ -6,6 +6,7 @@ from .utils import detect_display_server, detect_wayland_compositor
 from .pyautogui import PyAutoGuiBackend
 from .helper import LinuxInputHelperBackend
 from .win32 import Win32Backend
+from .uinput import UInputBackend
 
 __all__ = [
     'CapabilityTier',
@@ -16,4 +17,5 @@ __all__ = [
     'PyAutoGuiBackend',
     'LinuxInputHelperBackend',
     'Win32Backend',
+    'UInputBackend',
 ]

@@ -1,4 +1,4 @@
-# ⬡ TouchBridge
+# ⬡TouchBridge
 ### Modern Cross-Platform Remote Desktop
 **Electron · React · Python · Flutter**
 
@@ -11,7 +11,7 @@
 TouchBridge is a secure, cross-platform remote desktop application that lets you share your screen and control remote machines over a local network. It combines a Python TCP server with an Electron/React frontend for desktop and a Flutter app for Android.
 
 **Key Features:**
-- Real-time screen capture streamed over TCP (JPEG, port 8080)
+- Real-time screen capture streamed over TCP (H.264 by default, JPEG optional, port 8080)
 - Remote input control — keyboard, mouse, and touch (port 9999)
 - Dual roles: Host a session (Server Mode) or join one (Client Mode)
 - 5 built-in color themes: Obsidian, Aurora, Ember, Arctic, Matrix
@@ -32,6 +32,33 @@ chmod +x start.sh && ./start.sh
 ```bat
 start.bat
 ```
+
+---
+
+## Remote input backends
+
+| Host OS | Backend |
+|---------|---------|
+| Windows | `pyautogui` (native Win32 only as a fallback) |
+| Linux X11 | native XTest helper → `pyautogui` |
+| Linux Wayland | `/dev/uinput` via `python-evdev` (virtual mouse + keyboard) → ydotool script as fallback |
+| Android | Accessibility Service in the Flutter app |
+
+Wayland one-time setup: `sudo ./setup_uinput.sh`, then log out and back in. Keyboard input through uinput assumes a US layout.
+
+---
+
+## Video Codec (H.264 / JPEG)
+
+Every device that can host (Windows, Linux, Android) has a **Video Codec** option in *Settings*: **H.264** (default) or **JPEG**. It applies to the stream *this* device sends when hosting, and can be switched live during a session. Viewing needs no setting — each frame is self-describing, so any device can watch either codec, including a mid-session switch.
+
+- **Wire format** (port 8080, after `stream:<token>\n`): `[4-byte length][payload]`. A payload is a JPEG/PNG image, or an H.264 access unit: `"TBH4"` + 1 flag byte (bit 0 = keyframe) + Annex-B NAL units. Keyframes (every ~2 s) carry SPS+PPS in-band.
+- **Desktop host**: Electron's WebCodecs `VideoEncoder` (`capture-window/h264-encoder.js`). If the machine has no usable H.264 encoder it falls back to JPEG automatically and logs it. Quality presets set max width + bitrate under H.264.
+- **Desktop viewer**: WebCodecs `VideoDecoder` into a canvas (`src/h264Player.js`).
+- **Android host**: hardware `MediaCodec` encoder fed by the MediaProjection display (`ScreenCaptureService.kt`); switching codec re-targets the display without a new permission prompt.
+- **Android viewer**: `MediaCodec` decoder into a Flutter texture (`H264TextureDecoder.kt`).
+- **Relay** (`server.py`): caches the current GOP so new viewers start at a keyframe; a viewer that falls behind skips to the next keyframe instead of corrupting the picture. JPEG viewers still get newest-frame-only.
+- Android hosts now also serve the persistent `stream:` mode (previously only one-shot `capture:`), so Electron viewers get a continuous stream from them.
 
 ---
 

@@ -106,10 +106,30 @@ contextBridge.exposeInMainWorld('api', {
   // { ok, fileName } on success, { ok:false, canceled:true } if the user
   // dismissed the picker, or { ok:false, error } otherwise.
   sendHostFile:   () => ipcRenderer.invoke('send-host-file'),
-  sendClientFile: () => ipcRenderer.invoke('send-client-file'),
+  sendClientFile: (target) => ipcRenderer.invoke('send-client-file', target), // target: 'all' | 'host'
 
   // Screen-capture quality: 'low' | 'medium' | 'high' | 'ultra'.
   setCaptureQuality: (quality) => ipcRenderer.invoke('set-capture-quality', quality),
+
+  // Audio sharing. getAudioSource resolves { source: 'off'|'mic'|'system', platform }.
+  getAudioSource: () => ipcRenderer.invoke('get-audio-source'),
+  setAudioSource: (source) => ipcRenderer.invoke('set-audio-source', source),
+  // Viewer side: host audio chunks (ArrayBuffer, "TBA1" payload).
+  onScreenAudio: (cb) => {
+    const h = (_, ab) => cb(ab);
+    ipcRenderer.on('screen-audio', h);
+    return () => ipcRenderer.removeListener('screen-audio', h);
+  },
+
+  // Video codec used when THIS machine hosts: 'h264' (default) | 'jpeg'.
+  // getVideoCodec resolves { codec, active } — `active` is what the capture
+  // window is really producing (null if not hosting), which is 'jpeg' even
+  // when codec is 'h264' on a machine with no H.264 encoder. Viewing needs no
+  // setting: the codec is detected per frame.
+  getVideoCodec: () => ipcRenderer.invoke('get-video-codec'),
+  setVideoCodec: (codec) => ipcRenderer.invoke('set-video-codec', codec),
+  onCaptureCodec:  (cb) => ipcRenderer.on('capture-codec', (_, codec) => cb(codec)),
+  offCaptureCodec: ()   => ipcRenderer.removeAllListeners('capture-codec'),
 
   // Server logs
   onServerLog: (cb) => ipcRenderer.on('server-log', (_, msg) => cb(msg)),

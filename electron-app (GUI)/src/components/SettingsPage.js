@@ -11,7 +11,12 @@ export default function SettingsPage() {
   const [controlPort, setControlPort] = useState('9999');
   const [savedMsg, setSavedMsg] = useState('');
   const [captureQuality, setCaptureQualityState] = useState('high');
+  const [videoCodec, setVideoCodecState] = useState('h264');
+  const [activeCodec, setActiveCodec] = useState(null); // what's really being sent right now (null = not hosting)
   const [chatEnabled, setChatEnabledState] = useState(true);
+  const [audioSource, setAudioSourceState] = useState('off'); // host: 'off' | 'mic' | 'system'
+  const [audioPlatform, setAudioPlatform] = useState('');
+  const [playRemoteAudio, setPlayRemoteAudioState] = useState(true); // viewer: play the host's audio
 
   // Device identity — the ID is permanent (created once, on first run),
   // the password can be changed here to something that won't get
@@ -27,13 +32,21 @@ export default function SettingsPage() {
     window.api?.get('lastScreenPort').then(v => { if (v) setScreenPort(v); });
     window.api?.get('lastControlPort').then(v => { if (v) setControlPort(v); });
     window.api?.get('captureQuality').then(v => { if (v) setCaptureQualityState(v); });
+    window.api?.getVideoCodec().then(v => {
+      if (v?.codec) setVideoCodecState(v.codec);
+      setActiveCodec(v?.active ?? null);
+    });
+    window.api?.onCaptureCodec?.(setActiveCodec);
     window.api?.getChatDefault().then(v => setChatEnabledState(v !== false));
+    window.api?.getAudioSource?.().then(v => { if (v) { setAudioSourceState(v.source || 'off'); setAudioPlatform(v.platform || ''); } });
+    window.api?.get('playRemoteAudio').then(v => setPlayRemoteAudioState(v !== false));
     window.api?.getDeviceId().then(res => {
       if (res?.ok) {
         setDeviceId(res.id);
         setHostPassword(res.password);
       }
     });
+    return () => window.api?.offCaptureCodec?.();
   }, []);
 
   const savePermanentPassword = async () => {
@@ -55,6 +68,25 @@ export default function SettingsPage() {
     const res = await window.api?.setCaptureQuality(quality);
     if (!res?.ok) {
       window.api?.get('captureQuality').then(v => setCaptureQualityState(v || 'high'));
+    }
+  };
+
+  const changeAudioSource = async (source) => {
+    const res = await window.api?.setAudioSource(source);
+    if (res?.ok) setAudioSourceState(source);
+  };
+
+  const togglePlayRemoteAudio = async () => {
+    const next = !playRemoteAudio;
+    setPlayRemoteAudioState(next);
+    await window.api?.set('playRemoteAudio', next);
+  };
+
+  const changeVideoCodec = async (codec) => {
+    setVideoCodecState(codec); // optimistic
+    const res = await window.api?.setVideoCodec(codec);
+    if (!res?.ok) {
+      window.api?.getVideoCodec().then(v => setVideoCodecState(v?.codec || 'h264'));
     }
   };
 
@@ -151,15 +183,86 @@ export default function SettingsPage() {
               </div>
             </div>
 
+            {/* ── Video Codec ── */}
+            <div>
+              <div className="settings-section-title">Video Codec</div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                {[
+                  { key: 'h264', label: 'H.264', hint: 'smooth · low bandwidth · default' },
+                  { key: 'jpeg', label: 'JPEG', hint: 'compatibility · frame by frame' },
+                ].map(opt => (
+                  <button
+                    key={opt.key}
+                    onClick={() => changeVideoCodec(opt.key)}
+                    className={`btn ${videoCodec === opt.key ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2, padding: '10px 8px' }}
+                  >
+                    <span>{opt.label}</span>
+                    <span style={{ fontSize: 9, opacity: 0.7, fontWeight: 400 }}>{opt.hint}</span>
+                  </button>
+                ))}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                Used when this device hosts a session. H.264 sends only what changed between
+                frames, so it is far smoother at the same sharpness and uses much less
+                bandwidth than JPEG. Viewing needs no setting — the codec is detected
+                automatically, so any device can watch either. If this machine has no usable
+                H.264 encoder it falls back to JPEG on its own. Takes effect immediately, even
+                mid-session.
+                {activeCodec && (
+                  <div style={{ marginTop: 6, color: 'var(--accent)' }}>
+                    Currently streaming: {activeCodec === 'h264' ? 'H.264' : 'JPEG'}
+                    {videoCodec === 'h264' && activeCodec === 'jpeg' ? ' (H.264 unavailable on this machine)' : ''}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ── Audio ── */}
+            <div>
+              <div className="settings-section-title">Audio</div>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 8 }}>
+                Share sound from this device (when it hosts)
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                {[
+                  { key: 'off', label: 'Off', hint: 'no audio · default' },
+                  { key: 'system', label: 'System sound', hint: audioPlatform === 'darwin' ? 'not available on macOS' : 'what this device plays' },
+                  { key: 'mic', label: 'Microphone', hint: 'this device\'s mic' },
+                ].map(opt => (
+                  <button
+                    key={opt.key}
+                    onClick={() => changeAudioSource(opt.key)}
+                    disabled={opt.key === 'system' && audioPlatform === 'darwin'}
+                    className={`btn ${audioSource === opt.key ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2, padding: '10px 8px' }}
+                  >
+                    <span>{opt.label}</span>
+                    <span style={{ fontSize: 9, opacity: 0.7, fontWeight: 400 }}>{opt.hint}</span>
+                  </button>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, fontSize: 12, color: 'var(--text-2)', cursor: 'pointer' }}>
+                <input type="checkbox" checked={playRemoteAudio} onChange={togglePlayRemoteAudio} />
+                Play the host's audio on this device when viewing
+              </label>
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                Audio is sent to every connected viewer along with the screen and takes effect
+                immediately, even mid-session. Off by default. System sound needs PulseAudio /
+                PipeWire (`parec`) on Linux and is not available on macOS; the microphone works
+                everywhere. Viewers can also mute it from the toolbar.
+              </div>
+            </div>
+
             {/* ── Screen Quality ── */}
             <div>
               <div className="settings-section-title">Screen Quality</div>
               <div style={{ display: 'flex', gap: 10 }}>
                 {[
-                  { key: 'low', label: 'Low', hint: 'more compression · faster' },
-                  { key: 'medium', label: 'Medium', hint: 'balanced' },
-                  { key: 'high', label: 'High', hint: 'sharp · default' },
-                  { key: 'ultra', label: 'Ultra', hint: 'lossless PNG · sharpest text' },
+                  { key: 'low', label: 'Low', hint: videoCodec === 'h264' ? '1280 px · 2.5 Mbps' : 'more compression · faster' },
+                  { key: 'medium', label: 'Medium', hint: videoCodec === 'h264' ? '1600 px · 5 Mbps' : 'balanced' },
+                  { key: 'high', label: 'High', hint: videoCodec === 'h264' ? '1920 px · 8 Mbps' : 'sharp · default' },
+                  { key: 'ultra', label: 'Ultra', hint: videoCodec === 'h264' ? 'native size · 20 Mbps' : 'lossless PNG · sharpest text' },
                 ].map(opt => (
                   <button
                     key={opt.key}
@@ -173,11 +276,10 @@ export default function SettingsPage() {
                 ))}
               </div>
               <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
-                Resolution is always captured at full native size — this only controls
-                compression. Low/Medium/High use JPEG (smaller frames, some softening
-                around edges/text). Ultra switches to lossless PNG — no compression
-                artifacts at all, so text stays pixel-sharp, at the cost of larger
-                frames. Takes effect immediately, even mid-session.
+                {videoCodec === 'h264'
+                  ? 'With H.264 the presets set the maximum width and the bitrate. Ultra streams at the screen\'s native size with a high bitrate — near-transparent text, though not bit-exact like PNG. '
+                  : 'Resolution is always captured at full native size — this only controls compression. Low/Medium/High use JPEG (smaller frames, some softening around edges/text). Ultra switches to lossless PNG — no compression artifacts at all, so text stays pixel-sharp, at the cost of larger frames. '}
+                Takes effect immediately, even mid-session.
               </div>
             </div>
 

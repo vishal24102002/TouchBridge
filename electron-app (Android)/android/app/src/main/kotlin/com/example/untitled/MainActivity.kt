@@ -9,23 +9,48 @@ package com.example.untitled
 
 import android.app.Activity
 import android.content.ComponentName
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.TextUtils
 import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private val SCREEN_CAPTURE_CHANNEL = "touchbridge/screen_capture"
+    private val SCREEN_FRAMES_CHANNEL = "touchbridge/screen_capture_frames"
+    private val H264_DECODER_CHANNEL = "touchbridge/h264_decoder"
     private val INPUT_INJECTION_CHANNEL = "touchbridge/input_injection"
+    private val AUDIO_FRAMES_CHANNEL = "touchbridge/screen_audio"
+    private val AUDIO_PLAYER_CHANNEL = "touchbridge/audio_player"
+    private val REQUEST_CODE_RECORD_AUDIO = 4243
     private val REQUEST_CODE_SCREEN_CAPTURE = 4242
 
     private var pendingPermissionResult: MethodChannel.Result? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Host side: H.264 payloads pushed to Dart (see ScreenCaptureService).
+    private var frameSink: EventChannel.EventSink? = null
+
+    // Host side: audio chunks pushed to Dart; and a pending mic-permission prompt.
+    private var audioSink: EventChannel.EventSink? = null
+    private var pendingAudioSource: String? = null
+    private var pendingAudioResult: MethodChannel.Result? = null
+
+    // Viewer side: plays the host's shared audio.
+    private var audioPlayer: AudioPlayerNative? = null
+
+    // Viewer side: at most one live H.264 decoder (one remote session at a time).
+    private var h264Decoder: H264TextureDecoder? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -46,8 +71,17 @@ class MainActivity : FlutterActivity() {
                     }
                     "startCapture" -> {
                         if (ScreenCaptureService.hasPermission()) {
+                            // "h264" (default) or "jpeg"
+                            val codec = call.argument<String>("codec") ?: ScreenCaptureService.CODEC_H264
+                            ScreenCaptureService.requestedCodec = codec
+                            val audio = call.argument<String>("audio") ?: ScreenCaptureService.AUDIO_OFF
+                            val audioOk = audio == ScreenCaptureService.AUDIO_OFF ||
+                                checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                            ScreenCaptureService.audioSource = if (audioOk) audio else ScreenCaptureService.AUDIO_OFF
                             val intent = Intent(this, ScreenCaptureService::class.java)
                             intent.action = ScreenCaptureService.ACTION_START
+                            intent.putExtra(ScreenCaptureService.EXTRA_CODEC, codec)
+                            intent.putExtra(ScreenCaptureService.EXTRA_AUDIO, ScreenCaptureService.audioSource)
                             startForegroundService(intent)
                             result.success(true)
                         } else {
@@ -63,9 +97,129 @@ class MainActivity : FlutterActivity() {
                     "getLatestFrame" -> {
                         result.success(ScreenCaptureService.latestFrame())
                     }
+                    "getLatestFrameIfNew" -> {
+                        // null unless a new JPEG exists (always null in H.264 mode)
+                        result.success(ScreenCaptureService.takeNewFrame())
+                    }
+                    "setCodec" -> {
+                        ScreenCaptureService.applyCodec(
+                            call.argument<String>("codec") ?: ScreenCaptureService.CODEC_H264
+                        )
+                        result.success(null)
+                    }
+                    "getActiveCodec" -> {
+                        result.success(ScreenCaptureService.activeCodec)
+                    }
+                    "setAudioSource" -> {
+                        // "off" | "mic" | "system". Sharing sound needs the RECORD_AUDIO
+                        // permission (also for system sound), so ask for it here.
+                        val source = call.argument<String>("source") ?: ScreenCaptureService.AUDIO_OFF
+                        if (source == ScreenCaptureService.AUDIO_SYSTEM && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                            result.success(false) // system sound needs Android 10+
+                        } else if (source == ScreenCaptureService.AUDIO_OFF ||
+                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                            ScreenCaptureService.applyAudioSource(source)
+                            result.success(true)
+                        } else {
+                            pendingAudioResult?.success(false)
+                            pendingAudioSource = source
+                            pendingAudioResult = result
+                            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE_RECORD_AUDIO)
+                        }
+                    }
+                    "requestKeyframe" -> {
+                        ScreenCaptureService.requestKeyframe()
+                        result.success(null)
+                    }
                     else -> result.notImplemented()
                 }
             }
+
+        // Host side: every encoded H.264 access unit, pushed to Dart as it is produced.
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, SCREEN_FRAMES_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    frameSink = events
+                    ScreenCaptureService.frameListener = { bytes ->
+                        mainHandler.post { frameSink?.success(bytes) }
+                    }
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    frameSink = null
+                    ScreenCaptureService.frameListener = null
+                }
+            })
+
+        // Host side: audio chunks, pushed to Dart as they are captured.
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, AUDIO_FRAMES_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    audioSink = events
+                    ScreenCaptureService.audioListener = { bytes ->
+                        mainHandler.post { audioSink?.success(bytes) }
+                    }
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    audioSink = null
+                    ScreenCaptureService.audioListener = null
+                }
+            })
+
+        // Viewer side: play the host's audio through a streaming AudioTrack.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUDIO_PLAYER_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "play" -> {
+                        val bytes = call.arguments as? ByteArray
+                        if (bytes != null) {
+                            val player = audioPlayer ?: AudioPlayerNative().also { audioPlayer = it }
+                            player.play(bytes)
+                        }
+                        result.success(null)
+                    }
+                    "setMuted" -> {
+                        val muted = call.arguments as? Boolean ?: false
+                        val player = audioPlayer ?: AudioPlayerNative().also { audioPlayer = it }
+                        player.setMuted(muted)
+                        result.success(null)
+                    }
+                    "release" -> {
+                        audioPlayer?.release()
+                        audioPlayer = null
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // Viewer side: hardware H.264 decoding straight into a Flutter texture.
+        val decoderChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, H264_DECODER_CHANNEL)
+        decoderChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "create" -> {
+                    h264Decoder?.release()
+                    val entry = flutterEngine.renderer.createSurfaceTexture()
+                    val decoder = H264TextureDecoder(entry) { w, h ->
+                        decoderChannel.invokeMethod("onSize", mapOf("width" to w, "height" to h))
+                    }
+                    h264Decoder = decoder
+                    result.success(decoder.textureId)
+                }
+                "decode" -> {
+                    val bytes = call.arguments as? ByteArray
+                    if (bytes != null) h264Decoder?.submit(bytes)
+                    result.success(null)
+                }
+                "release" -> {
+                    h264Decoder?.release()
+                    h264Decoder = null
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, INPUT_INJECTION_CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -141,5 +295,27 @@ class MainActivity : FlutterActivity() {
             pendingPermissionResult?.success(granted)
             pendingPermissionResult = null
         }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_RECORD_AUDIO) {
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val source = pendingAudioSource
+            if (granted && source != null) ScreenCaptureService.applyAudioSource(source)
+            pendingAudioResult?.success(granted)
+            pendingAudioResult = null
+            pendingAudioSource = null
+        }
+    }
+
+    override fun onDestroy() {
+        audioPlayer?.release()
+        audioPlayer = null
+        h264Decoder?.release()
+        h264Decoder = null
+        super.onDestroy()
     }
 }

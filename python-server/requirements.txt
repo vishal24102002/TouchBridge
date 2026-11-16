@@ -10,3 +10,9 @@ colorama>=0.4.6
 # Wayland session, remote input control will not work until that's added
 # via ydotool/uinput, same limitation noted in the project README.)
 python-xlib>=0.33; sys_platform == "linux"
+
+# Linux/Wayland: virtual mouse + keyboard through /dev/uinput (see setup_uinput.sh)
+evdev>=1.6; sys_platform == "linux"
+
+# TLS certificate generation (security.py)
+cryptography>=41.0

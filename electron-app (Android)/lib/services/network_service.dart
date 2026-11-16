@@ -23,9 +23,17 @@ import 'security_service.dart' show ChatMessage;
 ///   <- {"status":"accepted","token":"..."}\n
 ///   <- {"status":"denied","reason":"bad_password"|"host_declined_or_timeout"}\n
 ///
-/// Screen (port 8080) — request/response, not a stream:
-///   -> "capture:<token>\n"
-///   <- latest JPEG/PNG bytes, then the server closes the connection.
+/// Screen (port 8080) — one persistent stream:
+///   -> "stream:<token>\n"
+///   <- [4-byte big-endian length][payload], repeated; length 0 = keepalive.
+///   Payload is either
+///     * a JPEG/PNG image (every frame stands alone), or
+///     * an H.264 access unit: "TBH4" + 1 flag byte (bit 0 = keyframe) +
+///       Annex-B NAL units. Keyframes carry SPS+PPS in-band and the stream
+///       always starts at one; delta frames must be decoded in order.
+///   The host chooses the codec (Settings) and may switch it mid-stream — the
+///   kind of each frame is detected from its first bytes.
+///   (Legacy "capture:<token>\n" still exists on hosts: one JPEG, then close.)
 ///   No data at all comes back if the token is invalid/expired.
 ///
 /// Control (port 9999) — persistent, newline-delimited plain text:
@@ -40,6 +48,7 @@ import 'security_service.dart' show ChatMessage;
 ///   <- "CHAT:<label>:<text>\n"
 ///   <- "CHAT_STATE:on|off\n"
 ///   <- "CHAT_ERROR:disabled\n"
+///   -> "chat:<text>" (to everyone) | "chat-host:<text>" (to the host only)
 ///   -> "mouse_move_abs:<fx>,<fy>" (preferred; fx/fy are 0.0-1.0 fractions
 ///      of the screen, computed from where the pointer/touch tip actually
 ///      is — no accumulated drift) | "mouse_move:<dx>,<dy>" (legacy
@@ -170,88 +179,189 @@ class PairingClient {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// Screen channel — polls a fresh TLS connection per frame, same cadence
-// as before, now carrying the session token.
+// Screen channel — one persistent TLS stream (see the protocol notes above).
+// JPEG/PNG frames come out of [frames]; H.264 access units (in order,
+// untouched) come out of [videoFrames]. Reconnects by itself if the stream
+// drops, until disconnect() is called.
 // ───────────────────────────────────────────────────────────────────────
 class ScreenFrameClient {
   String? _host;
   int? _port;
   String? _token;
-  Timer? _pollTimer;
-  bool _requestInFlight = false;
+  SecureSocket? _socket;
+  bool _closing = false;
+  Timer? _retryTimer;
 
   final _frameController = StreamController<Uint8List>.broadcast();
+  final _videoController = StreamController<Uint8List>.broadcast();
+  final _audioController = StreamController<Uint8List>.broadcast();
   final _stateController = StreamController<ConnectionState>.broadcast();
 
+  /// Host audio chunks ("TBA1" + channels + rate + PCM16LE), when the host shares sound.
+  Stream<Uint8List> get audioFrames => _audioController.stream;
+
+  /// JPEG/PNG frames.
   Stream<Uint8List> get frames => _frameController.stream;
+
+  /// H.264 payloads ("TBH4" + flag byte + Annex-B), in order.
+  Stream<Uint8List> get videoFrames => _videoController.stream;
   Stream<ConnectionState> get connectionState => _stateController.stream;
+
+  static bool isAudio(Uint8List p) =>
+      p.length > 9 && p[0] == 0x54 && p[1] == 0x42 && p[2] == 0x41 && p[3] == 0x31;
+
+  static bool isH264(Uint8List p) =>
+      p.length > 5 && p[0] == 0x54 && p[1] == 0x42 && p[2] == 0x48 && p[3] == 0x34;
 
   Future<void> connect(
       String host,
       int port,
       String token, {
-        Duration pollInterval = const Duration(milliseconds: 200),
-        Duration requestTimeout = const Duration(seconds: 6),
+        Duration requestTimeout = const Duration(seconds: 10),
       }) async {
     _host = host;
     _port = port;
     _token = token;
+    _closing = false;
     _stateController.add(ConnectionState.connecting);
 
-    final firstFrame = await _requestFrame(requestTimeout);
-    if (firstFrame == null) {
+    final ok = await _open(requestTimeout);
+    if (!ok) {
+      _closing = true; // no background retries after a failed first connect
       _stateController.add(ConnectionState.error);
       throw Exception('Could not reach $host:$port');
     }
-    _frameController.add(firstFrame);
     _stateController.add(ConnectionState.connected);
+  }
 
-    _pollTimer = Timer.periodic(pollInterval, (_) async {
-      if (_requestInFlight) return;
-      _requestInFlight = true;
-      final frame = await _requestFrame(requestTimeout);
-      _requestInFlight = false;
-      if (frame != null) _frameController.add(frame);
+  /// Opens the stream and resolves true once the first frame has arrived.
+  Future<bool> _open(Duration timeout) async {
+    final SecureSocket socket;
+    try {
+      socket = await connectPinnedTls(_host!, _port!, timeout: timeout);
+    } catch (_) {
+      return false;
+    }
+    try {
+      socket.setOption(SocketOption.tcpNoDelay, true);
+      socket.add(utf8.encode('stream:$_token\n'));
+      await socket.flush();
+    } catch (_) {
+      socket.destroy();
+      return false;
+    }
+    _socket = socket;
+
+    final parser = _FrameParser();
+    final first = Completer<bool>();
+    var established = false; // true once the first frame has arrived
+    void ended() {
+      if (!first.isCompleted) first.complete(false);
+      if (!established || !identical(_socket, socket)) return; // initial failures are reported by the caller
+      _socket = null;
+      if (_closing) return;
+      // Dropped mid-session (Wi-Fi hiccup, host restarted...): keep trying quietly.
+      _stateController.add(ConnectionState.connecting);
+      _scheduleRetry(const Duration(seconds: 1));
+    }
+
+    socket.listen(
+          (chunk) {
+        try {
+          for (final frame in parser.add(chunk)) {
+            if (isAudio(frame)) {
+              _audioController.add(frame);
+            } else if (isH264(frame)) {
+              _videoController.add(frame);
+            } else {
+              _frameController.add(frame);
+            }
+            if (!first.isCompleted) {
+              established = true;
+              first.complete(true);
+            }
+          }
+        } catch (_) {
+          socket.destroy(); // corrupt stream
+        }
+      },
+      onDone: ended,
+      onError: (_) => ended(),
+      cancelOnError: true,
+    );
+    final ok = await first.future.timeout(timeout, onTimeout: () => false);
+    if (!ok) {
+      if (identical(_socket, socket)) _socket = null;
+      socket.destroy();
+    }
+    return ok;
+  }
+
+  void _scheduleRetry(Duration delay) {
+    if (_closing) return;
+    _retryTimer?.cancel();
+    _retryTimer = Timer(delay, () async {
+      if (_closing) return;
+      final ok = await _open(const Duration(seconds: 6));
+      if (_closing) return;
+      if (ok) {
+        _stateController.add(ConnectionState.connected);
+      } else {
+        _scheduleRetry(const Duration(seconds: 2));
+      }
     });
   }
 
-  Future<Uint8List?> _requestFrame(Duration timeout) async {
-    SecureSocket? socket;
-    try {
-      socket = await connectPinnedTls(_host!, _port!, timeout: timeout);
-      socket.add(utf8.encode('capture:$_token\n'));
-      await socket.flush();
-
-      final chunks = BytesBuilder(copy: false);
-      final completer = Completer<void>();
-      final sub = socket.listen(
-        chunks.add,
-        onDone: () => completer.complete(),
-        onError: (_) => completer.complete(),
-        cancelOnError: true,
-      );
-      await completer.future.timeout(timeout, onTimeout: () {});
-      await sub.cancel();
-
-      final bytes = chunks.toBytes();
-      return bytes.isEmpty ? null : bytes;
-    } catch (_) {
-      return null;
-    } finally {
-      socket?.destroy();
-    }
-  }
-
   void disconnect() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
+    _closing = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _socket?.destroy();
+    _socket = null;
     _stateController.add(ConnectionState.disconnected);
   }
 
   void dispose() {
     disconnect();
     _frameController.close();
+    _videoController.close();
+    _audioController.close();
     _stateController.close();
+  }
+}
+
+/// Splits the byte stream into [4-byte length][payload] frames (length 0 =
+/// keepalive, skipped).
+class _FrameParser {
+  Uint8List _buf = Uint8List(64 * 1024);
+  int _start = 0;
+  int _end = 0;
+
+  List<Uint8List> add(Uint8List chunk) {
+    final avail = _end - _start;
+    if (_buf.length - _end < chunk.length) {
+      // Compact (and grow if still needed).
+      final target = (avail + chunk.length <= _buf.length)
+          ? _buf
+          : Uint8List((avail + chunk.length) * 2);
+      target.setRange(0, avail, _buf, _start);
+      _buf = target;
+      _start = 0;
+      _end = avail;
+    }
+    _buf.setRange(_end, _end + chunk.length, chunk);
+    _end += chunk.length;
+
+    final out = <Uint8List>[];
+    while (_end - _start >= 4) {
+      final n = (_buf[_start] << 24) | (_buf[_start + 1] << 16) | (_buf[_start + 2] << 8) | _buf[_start + 3];
+      if (n > 64 * 1024 * 1024) throw const FormatException('corrupt screen stream');
+      if (_end - _start - 4 < n) break;
+      if (n > 0) out.add(_buf.sublist(_start + 4, _start + 4 + n)); // sublist copies
+      _start += 4 + n;
+    }
+    if (_start == _end) _start = _end = 0;
+    return out;
   }
 }
 
@@ -440,7 +550,11 @@ class ControlChannelClient {
 
   /// Chat is NOT gated by the control grant — any paired, connected
   /// device may send a message as long as the host has chat turned on.
-  void sendChat(String text) => _send('chat:$text');
+  ///
+  /// [hostOnly] false (default) = everyone: the host and every other
+  /// connected device. true = the host only; the server never relays it.
+  void sendChat(String text, {bool hostOnly = false}) =>
+      _send('${hostOnly ? 'chat-host' : 'chat'}:$text');
 
   void disconnect() {
     _sub?.cancel();

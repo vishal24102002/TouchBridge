@@ -15,6 +15,9 @@ class SettingsService extends ChangeNotifier {
   static const _kControlPort = 'control_port';
   static const _kPairPort = 'pair_port';
   static const _kLabel = 'device_label';
+  static const _kVideoCodec = 'video_codec';
+  static const _kAudioSource = 'audio_source';
+  static const _kPlayRemoteAudio = 'play_remote_audio';
 
   AppThemeId themeId = AppThemeId.matrix; // Matrix is the default theme
   String defaultHost = '';
@@ -22,6 +25,16 @@ class SettingsService extends ChangeNotifier {
   int controlPort = 9999;
   int pairPort = 9997; // pairing/handshake port, matches server.py's default
   String deviceLabel = ''; // friendly name shown to hosts you pair with
+
+  /// Video codec used when this device HOSTS a session: 'h264' (default) or
+  /// 'jpeg'. Viewing needs no setting — the codec is detected per frame.
+  String videoCodec = 'h264';
+
+  /// Sound shared when this device HOSTS: 'off' (default) | 'system' | 'mic'.
+  String audioSource = 'off';
+
+  /// When VIEWING, play the host's shared audio (can still be muted on the viewer screen).
+  bool playRemoteAudio = true;
 
   SharedPreferences? _prefs;
 
@@ -39,6 +52,11 @@ class SettingsService extends ChangeNotifier {
     controlPort = _prefs!.getInt(_kControlPort) ?? 9999;
     pairPort = _prefs!.getInt(_kPairPort) ?? 9997;
     deviceLabel = _prefs!.getString(_kLabel) ?? '';
+    final codec = _prefs!.getString(_kVideoCodec);
+    videoCodec = (codec == 'jpeg') ? 'jpeg' : 'h264';
+    final audio = _prefs!.getString(_kAudioSource);
+    audioSource = (audio == 'mic' || audio == 'system') ? audio! : 'off';
+    playRemoteAudio = _prefs!.getBool(_kPlayRemoteAudio) ?? true;
     notifyListeners();
   }
 
@@ -77,6 +95,24 @@ class SettingsService extends ChangeNotifier {
   Future<void> setDeviceLabel(String label) async {
     deviceLabel = label;
     await _prefs?.setString(_kLabel, label);
+    notifyListeners();
+  }
+
+  Future<void> setVideoCodec(String codec) async {
+    videoCodec = codec == 'jpeg' ? 'jpeg' : 'h264';
+    await _prefs?.setString(_kVideoCodec, videoCodec);
+    notifyListeners();
+  }
+
+  Future<void> setAudioSource(String source) async {
+    audioSource = (source == 'mic' || source == 'system') ? source : 'off';
+    await _prefs?.setString(_kAudioSource, audioSource);
+    notifyListeners();
+  }
+
+  Future<void> setPlayRemoteAudio(bool value) async {
+    playRemoteAudio = value;
+    await _prefs?.setBool(_kPlayRemoteAudio, value);
     notifyListeners();
   }
 }

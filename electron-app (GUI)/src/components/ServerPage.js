@@ -60,6 +60,7 @@ export default function ServerPage() {
       setMessages(prev => [...prev, {
         id: `${msg.time}-${Math.random()}`, from: msg.from,
         text: msg.text, fileName: msg.fileName, savedPath: msg.savedPath, time: msg.time,
+        scope: msg.scope, // 'host' = sent to the host only
       }]);
     });
 
@@ -393,8 +394,13 @@ export default function ServerPage() {
               >
                 <div>
                   <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-0)' }}>
-                    {c.addr}
+                    {c.label || c.addr}
                   </div>
+                  {c.label && c.label !== c.addr && (
+                    <div style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>
+                      {c.addr}
+                    </div>
+                  )}
                   <div style={{
                     fontSize: 10, fontFamily: 'var(--font-mono)',
                     color: c.controlling ? 'var(--accent-2)' : 'var(--text-3)',
@@ -555,7 +561,7 @@ export default function ServerPage() {
                       <div key={m.id} className={`chat-message ${m.from === 'Host' ? 'from-host' : 'from-remote'}`}>
                         {m.from && m.from !== 'Host' && (
                           <div style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-3)', marginBottom: 2 }}>
-                            {m.from}
+                            {m.from}{m.scope === 'host' ? ' · 🔒 to you only' : ' · to everyone'}
                           </div>
                         )}
                         {m.fileName ? (

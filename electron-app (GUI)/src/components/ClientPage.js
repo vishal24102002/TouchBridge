@@ -1,5 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useNav } from '../App';
+import { H264Player } from '../h264Player';
+import { AudioPlayer } from '../audioPlayer';
 
 // All commands supported by server.py
 const SHORTCUTS = [
@@ -109,6 +111,7 @@ export default function ClientPage() {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState([]);
   const [chatDraft, setChatDraft] = useState('');
+  const [chatTarget, setChatTarget] = useState('all'); // who my messages go to: 'all' | 'host'
   const [fileSending, setFileSending] = useState(false);
   const chatScrollRef = useRef(null);
 
@@ -119,6 +122,19 @@ export default function ClientPage() {
   const zoomReset = () => setZoom(1);
 
   const imgRef = useRef(null);
+  // H.264 frames are decoded by H264Player into a <canvas>; JPEG/PNG frames go
+  // into the <img>. The host can switch codec mid-session, so the view follows
+  // whatever kind of frame arrives (viewMode / viewModeRef).
+  const canvasRef = useRef(null);
+  const playerRef = useRef(null);
+  const audioRef = useRef(null);          // AudioPlayer for the host's shared audio
+  const audioMutedRef = useRef(false);
+  const [audioMuted, setAudioMuted] = useState(false);
+  const [hasAudio, setHasAudio] = useState(false); // the host is actually sending audio
+  const pendingVideoRef = useRef([]); // H.264 frames that arrived before the <canvas> mounted
+  const viewModeRef = useRef('image');
+  const [viewMode, setViewMode] = useState('image'); // 'image' | 'video'
+  const [videoNote, setVideoNote] = useState(null);
   const pendingUrlRef = useRef(null);
   const capturingRef = useRef(false);
   const streamArgsRef = useRef(null); // { host, port, token } for auto-retry / resume
@@ -285,10 +301,24 @@ export default function ClientPage() {
     setIsCapturing(false);
   };
 
-  // Paint a frame straight into the <img> (no React re-render per frame).
+  // Paint a frame straight into the <img> / <canvas> (no React re-render per frame).
   useEffect(() => {
     if (!window.api?.onScreenFrame) return undefined;
     const offFrame = window.api.onScreenFrame((ab, mime) => {
+      if (mime === 'video/h264') {
+        if (viewModeRef.current !== 'video') { viewModeRef.current = 'video'; setViewMode('video'); }
+        const player = playerRef.current;
+        if (player) {
+          player.push(ab);
+        } else { // <canvas> not mounted yet: queue (capped) and let the ref callback flush
+          const q = pendingVideoRef.current;
+          q.push(ab);
+          if (q.length > 300) q.shift();
+          setHasFrame(true);
+        }
+        return;
+      }
+      if (viewModeRef.current !== 'image') { viewModeRef.current = 'image'; setViewMode('image'); }
       const url = URL.createObjectURL(new Blob([ab], { type: mime }));
       const img = imgRef.current;
       if (!img) { // first frame, <img> not mounted yet: the ref callback shows it
@@ -309,6 +339,39 @@ export default function ClientPage() {
     return () => { offFrame?.(); offEnded?.(); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Host audio (Settings → Audio on the host turns it on). "Play host audio"
+  // in this device's Settings decides whether it starts muted; the speaker
+  // button in the toolbar toggles it for this session.
+  useEffect(() => {
+    let alive = true;
+    window.api?.get?.('playRemoteAudio').then((v) => {
+      if (alive && v === false) { audioMutedRef.current = true; setAudioMuted(true); }
+    }).catch(() => {});
+    let announced = false;
+    const off = window.api?.onScreenAudio?.((ab) => {
+      if (!audioRef.current) {
+        audioRef.current = new AudioPlayer();
+        audioRef.current.setMuted(audioMutedRef.current);
+      }
+      if (!announced) { announced = true; setHasAudio(true); }
+      audioRef.current.push(ab);
+    });
+    return () => {
+      alive = false;
+      off?.();
+      audioRef.current?.close();
+      audioRef.current = null;
+    };
+  }, []);
+
+  const toggleAudioMute = () => {
+    const next = !audioMutedRef.current;
+    audioMutedRef.current = next;
+    setAudioMuted(next);
+    audioRef.current?.setMuted(next);
+    if (!next) audioRef.current?.resume();
+  };
+
   const setImgEl = useCallback((el) => {
     imgRef.current = el;
     if (el && pendingUrlRef.current) {
@@ -318,8 +381,30 @@ export default function ClientPage() {
     }
   }, []);
 
+  const setCanvasEl = useCallback((el) => {
+    canvasRef.current = el;
+    if (!el) {
+      playerRef.current?.close();
+      playerRef.current = null;
+      return;
+    }
+    if (!playerRef.current) {
+      playerRef.current = new H264Player(el, {
+        onFrame: () => { fpsCounter.current++; },
+        onStatus: (msg) => setVideoNote(msg),
+      });
+    }
+    const queued = pendingVideoRef.current;
+    pendingVideoRef.current = [];
+    queued.forEach(ab => playerRef.current.push(ab));
+  }, []);
+
   const disconnect = async () => {
     stopCapture();
+    pendingVideoRef.current = [];
+    viewModeRef.current = 'image';
+    setViewMode('image');
+    setVideoNote(null);
     if (imgRef.current?.dataset.url) URL.revokeObjectURL(imgRef.current.dataset.url);
     await window.api?.controlDisconnect();
     setPhase('form');
@@ -389,8 +474,9 @@ export default function ClientPage() {
     const text = chatDraft.trim();
     if (!text || !chatAllowed) return;
     setChatDraft('');
-    setChatMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, from: 'You', text, time: Date.now() }]);
-    const res = await window.api?.controlSend(`chat:${text}`);
+    setChatMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, from: 'You', text, time: Date.now(), scope: chatTarget }]);
+    // chat: = everyone, chat-host: = the host only (server.py never relays it)
+    const res = await window.api?.controlSend(`${chatTarget === 'host' ? 'chat-host' : 'chat'}:${text}`);
     if (!res?.ok) {
       setChatMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, from: 'System', text: `Message not sent: ${res?.error || 'not connected'}`, time: Date.now() }]);
     }
@@ -399,11 +485,11 @@ export default function ClientPage() {
   const sendClientFile = async () => {
     if (!chatAllowed || fileSending) return;
     setFileSending(true);
-    const res = await window.api?.sendClientFile();
+    const res = await window.api?.sendClientFile(chatTarget);
     setFileSending(false);
     if (res?.canceled) return;
     if (res?.ok) {
-      setChatMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, from: 'You', fileName: res.fileName, time: Date.now() }]);
+      setChatMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, from: 'You', fileName: res.fileName, time: Date.now(), scope: chatTarget }]);
     } else {
       setChatMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, from: 'System', text: `File not sent: ${res?.error || 'not connected'}`, time: Date.now() }]);
     }
@@ -450,6 +536,18 @@ export default function ClientPage() {
     await sendCmd(`key:${typeText}`);
     setTypeText('');
   };
+
+  // Shared look of the two remote-screen elements (<img> for JPEG/PNG, <canvas>
+  // for H.264); only the one matching the current codec is displayed.
+  const screenStyle = (show) => ({
+    width: '100%',
+    height: '100%',
+    objectFit: 'contain',
+    display: show ? 'block' : 'none',
+    transform: `scale(${zoom})`,
+    transformOrigin: 'center center',
+    transition: zoom === 1 ? 'none' : 'transform 0.1s ease-out',
+  });
 
   // ── FORM ─────────────────────────────────────────────────────────────────────
   if (phase === 'form' || phase === 'connecting') {
@@ -699,21 +797,30 @@ export default function ClientPage() {
               onContextMenu={e => controlEnabled && e.preventDefault()}
             >
               {hasFrame ? (
-                <img
-                  className="screen-img"
-                  ref={setImgEl}
-                  alt="Remote Screen"
-                  draggable={false}
-                  style={{
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'contain',
-                    display: 'block',
-                    transform: `scale(${zoom})`,
-                    transformOrigin: 'center center',
-                    transition: zoom === 1 ? 'none' : 'transform 0.1s ease-out',
-                  }}
-                />
+                <>
+                  <img
+                    className="screen-img"
+                    ref={setImgEl}
+                    alt="Remote Screen"
+                    draggable={false}
+                    style={screenStyle(viewMode === 'image')}
+                  />
+                  <canvas
+                    className="screen-img"
+                    ref={setCanvasEl}
+                    style={screenStyle(viewMode === 'video')}
+                  />
+                  {videoNote && (
+                    <div style={{
+                      position: 'absolute', left: 8, bottom: 8, right: 8,
+                      background: 'rgba(0,0,0,0.65)', color: 'var(--text-1)',
+                      borderRadius: 7, padding: '6px 11px',
+                      fontSize: 11, fontFamily: 'var(--font-mono)',
+                    }}>
+                      {videoNote}
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="view-empty">
                   <div className="big-icon">⏳</div>
@@ -757,6 +864,15 @@ export default function ClientPage() {
                 </button>
               )}
               <span className="toolbar-sep" />
+              {hasAudio && (
+                <button
+                  className={`btn btn-icon ${audioMuted ? '' : 'active'}`}
+                  onClick={toggleAudioMute}
+                  title={audioMuted ? 'Host audio is muted — click to listen' : 'Listening to host audio — click to mute'}
+                >
+                  {audioMuted ? '🔇 Audio off' : '🔊 Audio'}
+                </button>
+              )}
               {isCapturing && (
                 <div className="live-badge">
                   <span className="pulse-dot" style={{ width: 5, height: 5 }} />
@@ -819,15 +935,33 @@ export default function ClientPage() {
                     ) : (
                       <div>{m.text}</div>
                     )}
-                    <div className="chat-message-time">{formatChatTime(m.time)}</div>
+                    <div className="chat-message-time">
+                      {m.from === 'You' ? (m.scope === 'host' ? '🔒 Host only · ' : 'Everyone · ') : ''}
+                      {formatChatTime(m.time)}
+                    </div>
                   </div>
+                ))}
+              </div>
+
+              {/* Who do my messages go to? Applies to text and files. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px 0' }}>
+                <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>SEND TO</span>
+                {[{ key: 'all', label: 'Everyone' }, { key: 'host', label: 'Host only' }].map(opt => (
+                  <button
+                    key={opt.key}
+                    className={`btn ${chatTarget === opt.key ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ width: 'auto', padding: '3px 10px', fontSize: 10 }}
+                    onClick={() => setChatTarget(opt.key)}
+                  >
+                    {opt.label}
+                  </button>
                 ))}
               </div>
 
               <div className="chat-input-row">
                 <button
                   className="btn btn-ghost chat-attach-btn"
-                  title="Send a file"
+                  title={chatTarget === 'host' ? 'Send a file to the host only' : 'Send a file to everyone'}
                   disabled={fileSending}
                   onClick={sendClientFile}
                 >
@@ -835,7 +969,7 @@ export default function ClientPage() {
                 </button>
                 <input
                   className="field-input chat-text-input"
-                  placeholder="Type a message…"
+                  placeholder={chatTarget === 'host' ? 'Message to host only…' : 'Message to everyone…'}
                   value={chatDraft}
                   onChange={e => setChatDraft(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && sendClientChatMessage()}

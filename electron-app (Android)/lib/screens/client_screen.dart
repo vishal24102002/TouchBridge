@@ -2,6 +2,9 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../services/audio_player_channel.dart';
+import '../services/device_info_service.dart';
+import '../services/h264_decoder_channel.dart';
 import '../services/network_service.dart';
 import '../services/security_service.dart' show ChatMessage;
 import '../services/settings_service.dart';
@@ -37,8 +40,15 @@ class _ClientScreenState extends State<ClientScreen> {
     _idController = TextEditingController();
     _passwordController = TextEditingController();
     _labelController = TextEditingController(
-      text: settings.deviceLabel.isNotEmpty ? settings.deviceLabel : 'My Phone',
+      text: settings.deviceLabel,
     );
+    // First run: name this device after the phone itself (e.g. "samsung SM-S911B")
+    // so the host's Connected Devices list shows a real name, not just an IP.
+    if (settings.deviceLabel.isEmpty) {
+      DeviceInfoService().getHostname().then((name) {
+        if (mounted && _labelController.text.isEmpty) _labelController.text = name;
+      });
+    }
   }
 
   Future<void> _connect(SettingsService settings) async {
@@ -74,7 +84,7 @@ class _ClientScreenState extends State<ClientScreen> {
       setState(() => _error = 'Enter the host\'s password');
       return;
     }
-    final label = _labelController.text.trim().isEmpty ? 'My Phone' : _labelController.text.trim();
+    final label = _labelController.text.trim().isEmpty ? await DeviceInfoService().getHostname() : _labelController.text.trim();
     await settings.setDeviceLabel(label);
 
     setState(() => _pairing = true);
@@ -421,13 +431,25 @@ class _RemoteView extends StatefulWidget {
 
 class _RemoteViewState extends State<_RemoteView> {
   Uint8List? _latestFrame;
+
+  // H.264 frames are decoded natively into a Flutter texture; JPEG/PNG frames
+  // go through Image.memory. The host can switch codec mid-session, so the
+  // view follows whatever kind of frame arrives last.
+  final H264Decoder _decoder = H264Decoder();
+  bool _videoMode = false;
+  bool _decoderStarting = false;
+  final List<Uint8List> _videoBacklog = []; // frames that arrive while the texture is being created
   int? _frameWidth;
   int? _frameHeight;
+  // Host audio (shown only once the host actually sends some).
+  bool _hasAudio = false;
+  bool _audioMuted = false;
   bool _controlsOpen = false;
   bool _chatOpen = false;
   bool _zoomMode = false;
   bool _controlAllowed = false;
   bool _chatEnabled = true;
+  bool _chatHostOnly = false; // false = my messages go to everyone, true = host only
   String? _capabilityNote;
   final _typeController = TextEditingController();
   final _chatController = TextEditingController();
@@ -473,8 +495,29 @@ class _RemoteViewState extends State<_RemoteView> {
     super.initState();
     _controlAllowed = widget.session.control.allowed;
     widget.session.screen.frames.listen((frame) {
-      if (mounted) setState(() => _latestFrame = frame);
+      if (mounted) setState(() {
+        _latestFrame = frame;
+        _videoMode = false;
+      });
       _updateFrameDimensions(frame);
+    });
+    widget.session.screen.videoFrames.listen(_onVideoFrame);
+    // Settings → Audio decides whether host audio starts muted; the speaker
+    // button in the bottom bar toggles it for this session.
+    _audioMuted = !context.read<SettingsService>().playRemoteAudio;
+    AudioPlayerChannel.setMuted(_audioMuted);
+    widget.session.screen.audioFrames.listen((chunk) {
+      if (!mounted) return;
+      if (!_hasAudio) setState(() => _hasAudio = true);
+      if (!_audioMuted) AudioPlayerChannel.play(chunk);
+    });
+    _decoder.onSize.listen((size) {
+      if (mounted) {
+        setState(() {
+          _frameWidth = size.width.round();
+          _frameHeight = size.height.round();
+        });
+      }
     });
     widget.session.control.onGrantChanged.listen((granted) {
       if (mounted) setState(() => _controlAllowed = granted);
@@ -497,8 +540,40 @@ class _RemoteViewState extends State<_RemoteView> {
     });
   }
 
+  Future<void> _onVideoFrame(Uint8List frame) async {
+    if (!mounted) return;
+    if (!_videoMode) setState(() => _videoMode = true);
+    if (_decoder.textureId == null || _decoderStarting) {
+      _videoBacklog.add(frame);
+      if (_videoBacklog.length > 300) _videoBacklog.removeAt(0);
+      if (!_decoderStarting && _decoder.textureId == null) {
+        _decoderStarting = true;
+        final ok = await _decoder.start();
+        if (!mounted) return;
+        if (!ok) {
+          _decoderStarting = false;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('This device cannot decode H.264 — ask the host to switch to JPEG in Settings')),
+          );
+          return;
+        }
+        // Flush in order BEFORE accepting live frames again.
+        for (final f in _videoBacklog) {
+          _decoder.decode(f);
+        }
+        _videoBacklog.clear();
+        _decoderStarting = false;
+        setState(() {});
+      }
+      return;
+    }
+    _decoder.decode(frame);
+  }
+
   @override
   void dispose() {
+    AudioPlayerChannel.release();
+    _decoder.release();
     _typeController.dispose();
     _chatController.dispose();
     _transformController.dispose();
@@ -591,13 +666,27 @@ class _RemoteViewState extends State<_RemoteView> {
   void _sendChat() {
     final text = _chatController.text.trim();
     if (text.isEmpty) return;
-    widget.session.control.sendChat(text);
-    setState(() => _chatMessages.add(ChatMessage(from: 'You', text: text, time: DateTime.now(), isMe: true)));
+    widget.session.control.sendChat(text, hostOnly: _chatHostOnly);
+    setState(() => _chatMessages.add(
+        ChatMessage(from: 'You', text: text, time: DateTime.now(), isMe: true, hostOnly: _chatHostOnly)));
     _chatController.clear();
   }
 
   Widget _buildFrame() {
-    if (_latestFrame == null) {
+    final tex = _decoder.textureId;
+    if (_videoMode && tex != null && _frameWidth != null && _frameHeight != null) {
+      // Same letterboxing as Image's BoxFit.contain, so _contentRectFor's
+      // gesture mapping is identical for both codecs.
+      return FittedBox(
+        fit: BoxFit.contain,
+        child: SizedBox(
+          width: _frameWidth!.toDouble(),
+          height: _frameHeight!.toDouble(),
+          child: Texture(textureId: tex),
+        ),
+      );
+    }
+    if (_latestFrame == null || _videoMode) {
       return const Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -689,6 +778,8 @@ class _RemoteViewState extends State<_RemoteView> {
                       enabled: _chatEnabled,
                       controller: _chatController,
                       onSend: _sendChat,
+                      hostOnly: _chatHostOnly,
+                      onTargetChanged: (v) => setState(() => _chatHostOnly = v),
                       onClose: () => setState(() => _chatOpen = false),
                     ),
                   ),
@@ -756,6 +847,16 @@ class _RemoteViewState extends State<_RemoteView> {
                 ),
               ],
               const Spacer(),
+              if (_hasAudio && !_zoomMode)
+                IconButton(
+                  tooltip: _audioMuted ? 'Host audio muted — tap to listen' : 'Listening to host audio — tap to mute',
+                  icon: Icon(_audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                      color: _audioMuted ? Colors.white54 : Colors.cyanAccent, size: 20),
+                  onPressed: () {
+                    setState(() => _audioMuted = !_audioMuted);
+                    AudioPlayerChannel.setMuted(_audioMuted);
+                  },
+                ),
               if (!_zoomMode)
                 IconButton(
                   tooltip: 'Chat',
@@ -932,6 +1033,8 @@ class _ChatPanel extends StatelessWidget {
   final TextEditingController controller;
   final VoidCallback onSend;
   final VoidCallback onClose;
+  final bool hostOnly;
+  final ValueChanged<bool> onTargetChanged;
 
   const _ChatPanel({
     required this.messages,
@@ -939,6 +1042,8 @@ class _ChatPanel extends StatelessWidget {
     required this.controller,
     required this.onSend,
     required this.onClose,
+    required this.hostOnly,
+    required this.onTargetChanged,
   });
 
   @override
@@ -996,6 +1101,9 @@ class _ChatPanel extends StatelessWidget {
                             if (!m.isMe)
                               Text(m.from, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white54)),
                             Text(m.text, style: const TextStyle(fontFamily: 'monospace', fontSize: 13, color: Colors.white)),
+                            if (m.isMe)
+                              Text(m.hostOnly ? '🔒 Host only' : 'Everyone',
+                                  style: const TextStyle(fontSize: 9, color: Colors.white38)),
                           ],
                         ),
                       ),
@@ -1006,6 +1114,29 @@ class _ChatPanel extends StatelessWidget {
             ),
             if (enabled)
               Padding(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+                child: Row(
+                  children: [
+                    const Text('SEND TO', style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: Colors.white38)),
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      label: const Text('Everyone', style: TextStyle(fontSize: 11)),
+                      selected: !hostOnly,
+                      visualDensity: VisualDensity.compact,
+                      onSelected: (_) => onTargetChanged(false),
+                    ),
+                    const SizedBox(width: 6),
+                    ChoiceChip(
+                      label: const Text('Host only', style: TextStyle(fontSize: 11)),
+                      selected: hostOnly,
+                      visualDensity: VisualDensity.compact,
+                      onSelected: (_) => onTargetChanged(true),
+                    ),
+                  ],
+                ),
+              ),
+            if (enabled)
+              Padding(
                 padding: const EdgeInsets.all(12),
                 child: Row(
                   children: [
@@ -1014,7 +1145,7 @@ class _ChatPanel extends StatelessWidget {
                         controller: controller,
                         style: const TextStyle(fontFamily: 'monospace', color: Colors.white, fontSize: 14),
                         decoration: InputDecoration(
-                          hintText: 'Message the host…',
+                          hintText: hostOnly ? 'Message to host only…' : 'Message to everyone…',
                           hintStyle: const TextStyle(color: Colors.white38),
                           isDense: true,
                           filled: true,

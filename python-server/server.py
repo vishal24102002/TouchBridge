@@ -3,19 +3,32 @@
 TouchBridge Python server (relay mode)
 ---------------------------------------
 Screen capture is now done by Electron (desktopCapturer + getUserMedia +
-canvas), NOT by this script. Electron pipes JPEG frames to this process's
-stdin, length-prefixed:
+canvas / WebCodecs), NOT by this script. Electron pipes encoded frames to
+this process's stdin, length-prefixed:
 
-    [4-byte big-endian length][JPEG bytes]  (repeated, forever)
+    [4-byte big-endian length][payload]  (repeated, forever)
+
+where each payload is one of:
+    * JPEG / PNG image bytes (the "jpeg" codec setting; every frame stands
+      alone), or
+    * an H.264 access unit (the default "h264" codec setting):
+          b"TBH4" + 1 flag byte (bit 0 = keyframe) + Annex-B NAL units
+      Keyframes carry SPS+PPS in-band, so any viewer can start decoding at
+      one. Delta frames are only meaningful after their keyframe, so the
+      relay must never silently skip them (see FrameBuffer / ViewerCursor).
 
 This script:
   1. Reads that stream on a background thread and keeps the most recent
-     frame in memory (FrameBuffer).
+     frame — plus, for H.264, every frame since the last keyframe — in
+     memory (FrameBuffer).
   2. Serves it on TCP port 8080 (TLS-wrapped). Preferred: the client sends
      "stream:<session-token>\n" once and then receives a continuous
-     [4-byte length][JPEG/PNG] stream, newest frame only (zero length =
-     keepalive). Legacy: "capture:<session-token>\n" returns one frame and
-     closes. Either way the token must currently be valid (see below).
+     [4-byte length][payload] stream (zero length = keepalive). Images:
+     newest frame only. H.264: every frame in order, starting from the
+     latest keyframe; a viewer that falls too far behind skips to the next
+     keyframe instead of decoding garbage. Legacy:
+     "capture:<session-token>\n" returns one JPEG/PNG and closes. Either
+     way the token must currently be valid (see below).
   3. Runs a persistent TCP control server on port 9999 (also TLS-wrapped):
      newline-delimited text commands, but the very first line a client
      sends must be "AUTH:<session-token>\n" before anything else is
@@ -113,25 +126,135 @@ def log(msg: str):
 # ─────────────────────────────────────────────────────────────────────────
 # Frame buffer — filled by the stdin reader thread, read by screen clients
 # ─────────────────────────────────────────────────────────────────────────
+H264_MAGIC = b"TBH4"          # payload prefix for H.264 access units (see module docstring)
+H264_FLAG_KEYFRAME = 0x01
+AUDIO_MAGIC = b"TBA1"         # audio chunk: "TBA1" + channels u8 + sample-rate u32 BE + PCM16LE
+AUDIO_MAX_BACKLOG = 40        # audio chunks (~20-40 ms each) a viewer may lag before the oldest are dropped
+
+GOP_MAX_FRAMES = 900          # safety cap on frames cached since the last keyframe
+GOP_MAX_BYTES = 64 * 1024 * 1024
+VIEWER_MAX_BACKLOG = 20       # H.264 frames a viewer may be behind before it skips to the next keyframe
+
+
+def is_h264(payload: bytes) -> bool:
+    return payload[:4] == H264_MAGIC
+
+
+def is_audio(payload: bytes) -> bool:
+    return payload[:4] == AUDIO_MAGIC
+
+
+def is_h264_keyframe(payload: bytes) -> bool:
+    return len(payload) > 4 and payload[:4] == H264_MAGIC and bool(payload[4] & H264_FLAG_KEYFRAME)
+
+
+class ViewerCursor:
+    """Per-viewer delivery state for FrameBuffer.next_for()."""
+
+    def __init__(self):
+        self.last_seq = 0
+        self.wait_key = False   # skipped some delta frames -> hold until the next keyframe
+        self.last_aseq = 0      # last audio chunk delivered
+
+
 class FrameBuffer:
-    """Holds only the NEWEST frame. Each streaming viewer waits on the
-    condition and always gets the latest one, so a slow viewer skips frames
-    instead of falling behind (this is what keeps latency flat)."""
+    """Holds the newest frame and, for H.264, the frames since the last keyframe.
+
+    Image (JPEG/PNG) viewers only ever get the newest frame, so a slow viewer
+    skips frames instead of falling behind (this keeps latency flat).
+
+    H.264 viewers must receive every frame since a keyframe, in order — a
+    dropped delta frame corrupts everything until the next keyframe. So the
+    buffer caches the current GOP (group of pictures): a new viewer starts from
+    the latest keyframe, and a viewer that falls too far behind abandons the
+    rest of the GOP and waits for the next keyframe instead.
+    """
 
     def __init__(self):
         self._cond = threading.Condition()
-        self._frame = b""
         self._seq = 0
+        self._frame = b""          # newest frame of any kind
+        self._image = b""          # newest JPEG/PNG frame (legacy one-shot mode)
+        self._gop = []             # [(seq, payload)] from the last keyframe on
+        self._gop_bytes = 0
+        self._aseq = 0
+        self._audio = []           # [(aseq, payload)] newest audio chunks (small ring)
 
     def set(self, data: bytes):
         with self._cond:
-            self._frame = data
+            if is_audio(data):
+                # Audio is its own lane: it never touches the video sequence or GOP cache.
+                self._aseq += 1
+                self._audio.append((self._aseq, data))
+                if len(self._audio) > AUDIO_MAX_BACKLOG:
+                    del self._audio[: len(self._audio) - AUDIO_MAX_BACKLOG]
+                self._cond.notify_all()
+                return
+            if is_h264(data):
+                if is_h264_keyframe(data):
+                    self._gop = [(self._seq + 1, data)]
+                    self._gop_bytes = len(data)
+                elif self._gop:
+                    if (len(self._gop) >= GOP_MAX_FRAMES
+                            or self._gop_bytes + len(data) > GOP_MAX_BYTES):
+                        # Encoder stopped emitting keyframes — drop the cache; viewers wait for the next one.
+                        self._gop = []
+                        self._gop_bytes = 0
+                        return
+                    self._gop.append((self._seq + 1, data))
+                    self._gop_bytes += len(data)
+                else:
+                    return  # delta frame with no keyframe to hang it on — useless, ignore
+            else:
+                self._image = data
+                self._gop = []
+                self._gop_bytes = 0
             self._seq += 1
+            self._frame = data
             self._cond.notify_all()
 
     def get(self) -> bytes:
+        """Newest JPEG/PNG frame (legacy one-shot 'capture:' clients)."""
         with self._cond:
-            return self._frame
+            return self._image
+
+    def next_for(self, cursor: ViewerCursor, timeout: float):
+        """Block until there is something new for this viewer; returns the
+        payloads to send, in order (empty on timeout / when waiting for a keyframe).
+        Audio chunks (if any) come first, then video."""
+        with self._cond:
+            if self._seq == cursor.last_seq and self._aseq == cursor.last_aseq:
+                self._cond.wait(timeout)
+            out = []
+            if self._aseq != cursor.last_aseq:
+                out = [p for s, p in self._audio if s > cursor.last_aseq]
+                cursor.last_aseq = self._aseq
+            return out + self._video_for(cursor)
+
+    def _video_for(self, cursor: ViewerCursor):
+        # (lock held by caller)
+        if self._seq == cursor.last_seq:
+            return []
+        seq, latest = self._seq, self._frame
+
+        if not is_h264(latest):
+            cursor.last_seq = seq
+            cursor.wait_key = False
+            return [latest]
+
+        if not self._gop:
+            cursor.last_seq = seq
+            return []
+        if cursor.wait_key:
+            if self._gop[0][0] <= cursor.last_seq:
+                return []       # still the GOP we abandoned; keep waiting for a fresh keyframe
+            cursor.wait_key = False
+        pending = [p for s, p in self._gop if s > cursor.last_seq]
+        cursor.last_seq = seq
+        if len(pending) > VIEWER_MAX_BACKLOG and not is_h264_keyframe(pending[0]):
+            cursor.wait_key = True   # too far behind: drop the rest of this GOP
+            return []
+        return pending
 
     def wait_newer(self, last_seq: int, timeout: float):
         """Block until a frame newer than last_seq exists (or timeout)."""
@@ -139,6 +262,11 @@ class FrameBuffer:
             if self._seq == last_seq:
                 self._cond.wait(timeout)
             return self._seq, self._frame
+
+    @property
+    def audio_seq(self) -> int:
+        with self._cond:
+            return self._aseq
 
     @property
     def count(self) -> int:
@@ -150,8 +278,10 @@ frame_buffer = FrameBuffer()
 
 
 def stdin_reader_thread():
-    """Reads length-prefixed JPEG frames piped in from Electron on stdin."""
+    """Reads length-prefixed frames (JPEG/PNG or H.264) piped in from Electron on stdin."""
     stdin = sys.stdin.buffer
+    last_codec = None
+    audio_logged = False
     log("Waiting for frames from Electron on stdin...")
     while True:
         header = _read_exact(stdin, 4)
@@ -163,6 +293,16 @@ def stdin_reader_thread():
         if payload is None:
             log("stdin closed mid-frame — Electron capture stream ended")
             return
+        if is_audio(payload):
+            if not audio_logged:
+                log("Audio chunks from capture are flowing")
+                audio_logged = True
+            frame_buffer.set(payload)
+            continue
+        codec = "h264" if is_h264(payload) else "jpeg/png"
+        if codec != last_codec:
+            log(f"Video codec from capture: {codec}")
+            last_codec = codec
         frame_buffer.set(payload)
         if frame_buffer.count == 1:
             log("First frame received from Electron")
@@ -233,21 +373,26 @@ def handle_screen_client(conn: socket.socket, addr):
                 tls_conn.sendall(data)
             return
 
-        # Streaming mode: [4-byte big-endian length][JPEG/PNG bytes], repeated.
-        # A zero-length frame is a keepalive. Only the newest frame is ever
+        # Streaming mode: [4-byte big-endian length][payload], repeated. A
+        # zero-length frame is a keepalive. Images: only the newest frame is
         # sent, so a slow viewer drops frames rather than building up lag.
+        # H.264: every frame in order from the latest keyframe (see FrameBuffer).
         log(f"Viewer streaming: {addr[0]}")
         tls_conn.settimeout(STREAM_SEND_TIMEOUT)
-        last_seq = 0
+        audio_logged = False
+        cursor = ViewerCursor()
+        cursor.last_aseq = frame_buffer.audio_seq   # new viewers hear live audio, not the backlog
         last_sent = time.monotonic()
         last_check = last_sent
         while True:
-            seq, data = frame_buffer.wait_newer(last_seq, 1.0)
+            frames = frame_buffer.next_for(cursor, 1.0)
             now = time.monotonic()
-            if seq != last_seq and data:
-                last_seq = seq
-                tls_conn.sendall(struct.pack(">I", len(data)) + data)
+            if frames:
+                tls_conn.sendall(b"".join(struct.pack(">I", len(f)) + f for f in frames))
                 last_sent = now
+                if not audio_logged and any(is_audio(f) for f in frames):
+                    audio_logged = True
+                    log(f"Sending shared audio to viewer {addr[0]}")
             elif now - last_sent >= STREAM_KEEPALIVE_SECS:
                 tls_conn.sendall(b"\x00\x00\x00\x00")
                 last_sent = now
@@ -482,14 +627,17 @@ MAX_LINE_BYTES = 8 * 1024 * 1024
 
 
 def _emit_chat_to_electron(label: str, text: str = None, file_name_b64: str = None,
-                            file_data_b64: str = None, source: str = "remote"):
+                            file_data_b64: str = None, source: str = "remote",
+                            scope: str = "all"):
     """Tells Electron (and therefore the host's ServerPage) about a chat
     message — text or file — that just happened, so the host-side panel
     can show it. This is one-directional (server.py -> Electron); the
     host's own outgoing messages reach remote clients via
     control_session.broadcast(), called separately from the admin
     'chat:'/'file:' handlers."""
-    payload = {"from": label, "time": time.time(), "source": source}
+    # scope: "all" = relayed to every other device too; "host" = sent to the
+    # host only (never relayed). The host UI shows a "private" badge for it.
+    payload = {"from": label, "time": time.time(), "source": source, "scope": scope}
     if file_name_b64 is not None:
         payload["fileNameB64"] = file_name_b64
         payload["fileDataB64"] = file_data_b64
@@ -519,10 +667,14 @@ def handle_command(cmd: str):
     elif cmd.startswith("shortcut:"):
         name = cmd.split(":", 1)[1]
         keys = SHORTCUT_KEYS.get(name)
+        ok = backend.hotkey(*keys)
         if not keys:
             raise ValueError(f"Unknown shortcut: {name}")
-        backend.hotkey(*keys)
-
+        if ok:
+            log(f"[SHORTCUT] {name} -> {'+'.join(keys)} delivered (backend: {type(backend).__name__})")
+        else:
+            log(f"[WARN] shortcut '{name}' was not delivered (backend: {type(backend).__name__})")
+        
     elif cmd == "open_browser":
         webbrowser.open("https://")
     elif cmd == "open_terminal":
@@ -530,15 +682,12 @@ def handle_command(cmd: str):
     elif cmd.startswith("custom:open_folder"):
         open_folder()
 
-    elif cmd == "media_play_pause":
-        if pyautogui:
-            pyautogui.press("playpause")
-    elif cmd == "volume_up":
-        if pyautogui:
-            pyautogui.press("volumeup")
-    elif cmd == "volume_mute":
-        if pyautogui:
-            pyautogui.press("volumemute")
+    elif cmd in ("media_play_pause", "volume_up", "volume_mute"):
+        key = {"media_play_pause": "playpause", "volume_up": "volumeup", "volume_mute": "volumemute"}[cmd]
+        if hasattr(backend, "scroll"):      # uinput backend (Wayland): no pyautogui there
+            backend.press_key(key)
+        elif pyautogui:
+            pyautogui.press(key)
 
     else:
         raise ValueError(f"Unrecognized command: {cmd}")
@@ -640,28 +789,34 @@ def handle_control_client(conn: socket.socket, addr):
                 if not cmd:
                     continue
 
-                if cmd.startswith("chat:"):
+                if cmd.startswith("chat:") or cmd.startswith("chat-host:"):
                     # Chat isn't gated by the control grant — any paired,
                     # connected device can send a message regardless of
                     # whether it holds control, only whether the host has
                     # chat turned on at all.
-                    text = cmd[len("chat:"):]
+                    #   chat:<text>       -> everyone (host + all other devices)
+                    #   chat-host:<text>  -> the host only, never relayed
+                    host_only = cmd.startswith("chat-host:")
+                    text = cmd.split(":", 1)[1]
                     if not chat_state.get():
                         try:
                             conn.sendall(b"CHAT_ERROR:disabled\n")
                         except Exception:
                             pass
                         continue
-                    control_session.broadcast(f"CHAT:{label}:{text}\n", exclude_cid=cid)
-                    _emit_chat_to_electron(label, text, source="remote")
+                    if not host_only:
+                        control_session.broadcast(f"CHAT:{label}:{text}\n", exclude_cid=cid)
+                    _emit_chat_to_electron(label, text, source="remote",
+                                           scope="host" if host_only else "all")
                     continue
 
-                if cmd.startswith("file:"):
+                if cmd.startswith("file:") or cmd.startswith("file-host:"):
                     # Same channel/toggle as chat: — filename and content
                     # both travel as base64 (see electron.js), so this is
                     # still a plain newline-delimited text line rather than
                     # needing a separate binary framing scheme.
-                    payload = cmd[len("file:"):]
+                    host_only = cmd.startswith("file-host:")
+                    payload = cmd.split(":", 1)[1]
                     if not chat_state.get():
                         try:
                             conn.sendall(b"CHAT_ERROR:disabled\n")
@@ -678,8 +833,10 @@ def handle_control_client(conn: socket.socket, addr):
                         except Exception:
                             pass
                         continue
-                    control_session.broadcast(f"FILE:{label}:{payload}\n", exclude_cid=cid)
-                    _emit_chat_to_electron(label, file_name_b64=name_b64, file_data_b64=data_b64, source="remote")
+                    if not host_only:
+                        control_session.broadcast(f"FILE:{label}:{payload}\n", exclude_cid=cid)
+                    _emit_chat_to_electron(label, file_name_b64=name_b64, file_data_b64=data_b64,
+                                           source="remote", scope="host" if host_only else "all")
                     continue
 
                 if no_input_capability or not control_session.is_controller(cid):
