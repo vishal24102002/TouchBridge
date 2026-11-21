@@ -188,7 +188,7 @@ Server Mode turns your machine into a remote desktop host. The Python server sta
 
 Client Mode connects to a remote TouchBridge server. Enter the host's IP and ports, then click Connect.
 
-<img src="/assets/screenshots/client.png" alt="Client Mode" height="400"/> <img src="/assets/screenshots/Android_client.jpg" alt="Client Mode (Android)" height="400"/>
+<img src="/assets/screenshots/client.png" alt="Client Mode" height="350"/> <img src="/assets/screenshots/Android_client.jpg" alt="Client Mode (Android)" height="400"/>
 
 *Client Mode — enter the server IP and click Connect to start the remote session · Desktop (left) and Android (right)*
 
