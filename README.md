@@ -4,6 +4,8 @@
 
 > Secure screen sharing and remote control for Linux, Windows, and Android.
 
+<center><img src="/assets/screenshots/UI-Design.png" alt="UI Screens" height="480"/></center>
+
 ---
 
 ## Overview
