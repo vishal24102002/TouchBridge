@@ -251,11 +251,14 @@ function currentVideoCodec() {
   return VIDEO_CODECS.includes(c) ? c : DEFAULT_VIDEO_CODEC;
 }
 
-// Audio sharing: 'off' (default) | 'mic' | 'system'. Chosen in Settings.
+// Audio sharing: 'off' | 'mic' | 'system' (default on Windows/Linux). Chosen in Settings or on the Server page.
 const AUDIO_SOURCES = ['off', 'mic', 'system'];
+// Default: share system sound (Windows/Linux) so a viewer hears what the host
+// plays without any setup. macOS has no built-in loopback, so it stays off.
+const DEFAULT_AUDIO_SOURCE = process.platform === 'darwin' ? 'off' : 'system';
 function currentAudioSource() {
-  const a = store.get('audioSource', 'off');
-  return AUDIO_SOURCES.includes(a) ? a : 'off';
+  const a = store.get('audioSource', DEFAULT_AUDIO_SOURCE);
+  return AUDIO_SOURCES.includes(a) ? a : DEFAULT_AUDIO_SOURCE;
 }
 
 // Everything the capture window needs, for the current quality + codec.
@@ -811,6 +814,7 @@ function createWindow() {
       nodeIntegration: false,
       webSecurity: false,
       backgroundThrottling: false,
+      autoplayPolicy: 'no-user-gesture-required', // viewer audio must never be blocked by the autoplay policy
     },
   });
 

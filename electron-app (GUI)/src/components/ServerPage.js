@@ -10,6 +10,8 @@ export default function ServerPage() {
   const [clients, setClients] = useState([]); // connected control-channel devices, pushed live from server.py
   const [pendingRequests, setPendingRequests] = useState([]); // in-flight pairing requests awaiting Accept/Deny
   const [deviceId, setDeviceId] = useState('');
+  const [audioSource, setAudioSourceState] = useState('off'); // what this host shares: off | system | mic
+  const [audioPlatform, setAudioPlatform] = useState('');
   const [hostPassword, setHostPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const logRef = useRef(null);
@@ -26,6 +28,15 @@ export default function ServerPage() {
   const [draft, setDraft] = useState('');
   const [fileSending, setFileSending] = useState(false);
   const chatScrollRef = useRef(null);
+
+  useEffect(() => {
+    window.api?.getAudioSource?.().then(v => { if (v) { setAudioSourceState(v.source || 'off'); setAudioPlatform(v.platform || ''); } });
+  }, []);
+
+  const changeAudioSource = async (source) => {
+    const res = await window.api?.setAudioSource(source);
+    if (res?.ok) setAudioSourceState(source);
+  };
 
   useEffect(() => {
     // Listen for Python server logs
@@ -352,6 +363,30 @@ export default function ServerPage() {
                 </div>
               </div>
             )}
+          </div>
+        </div>
+
+        {/* Audio — what viewers hear. System sound = everything this
+            computer plays (Windows/Linux). Applies live, mid-session. */}
+        <div className="box">
+          <div className="box-title">Audio to Viewers</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {[
+              { key: 'system', label: '🔊 System', disabled: audioPlatform === 'darwin' },
+              { key: 'mic', label: '🎤 Mic' },
+              { key: 'off', label: '🔇 Off' },
+            ].map(opt => (
+              <button
+                key={opt.key}
+                disabled={opt.disabled}
+                onClick={() => changeAudioSource(opt.key)}
+                className={`btn ${audioSource === opt.key ? 'btn-primary' : 'btn-ghost'}`}
+                style={{ flex: 1, padding: '6px 0', fontSize: 11 }}
+                title={opt.disabled ? 'System sound is not available on macOS' : undefined}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
         </div>
 

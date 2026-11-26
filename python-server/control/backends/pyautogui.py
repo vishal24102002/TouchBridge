@@ -6,6 +6,7 @@ from typing import Optional
 try:
     import pyautogui
     pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
 except ImportError:
     pyautogui = None
 

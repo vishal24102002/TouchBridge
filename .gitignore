@@ -16,6 +16,7 @@ out/
 build/
 release/
 releases/
+cfg/
 
 # electron-builder / forge
 *.AppImage

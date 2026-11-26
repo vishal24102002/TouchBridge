@@ -20,6 +20,7 @@ export class AudioPlayer {
     this.gain = null;
     this.nextTime = 0;
     this.muted = false;
+    this.volume = 1;
     this.closed = false;
   }
 
@@ -29,13 +30,18 @@ export class AudioPlayer {
     if (!Ctor) return;
     this.ctx = new Ctor({ latencyHint: 'interactive' });
     this.gain = this.ctx.createGain();
-    this.gain.gain.value = this.muted ? 0 : 1;
+    this.gain.gain.value = this.muted ? 0 : this.volume;
     this.gain.connect(this.ctx.destination);
   }
 
   setMuted(m) {
     this.muted = !!m;
-    if (this.gain) this.gain.gain.value = this.muted ? 0 : 1;
+    if (this.gain) this.gain.gain.value = this.muted ? 0 : this.volume;
+  }
+
+  setVolume(v) {
+    this.volume = Math.min(1, Math.max(0, +v || 0));
+    if (this.gain && !this.muted) this.gain.gain.value = this.volume;
   }
 
   // Call from a user gesture (e.g. the Connect click) if the browser engine

@@ -79,6 +79,11 @@
         "deb"
       ],
       "category": "Network"
+    },
+    "deb": {
+      "depends": [
+        "pulseaudio-utils"
+      ]
     }
   },
   "browserslist": {

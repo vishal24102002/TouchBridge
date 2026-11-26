@@ -454,6 +454,48 @@ SHORTCUT_KEYS = {
     "f9": ("f9",), "f10": ("f10",), "f11": ("f11",), "f12": ("f12",),
 }
 
+# Live keyboard passthrough.  Wire format:  kb:<mod1,mod2,...>|<key>
+# Key contents are never logged — they can be passwords.
+KB_MODIFIERS = {
+    "ctrl": "ctrl",
+    "alt": "alt",
+    "shift": "shift",
+    "meta": "win" if PLATFORM == "windows" else "super",
+}
+KB_NAMED_KEYS = {
+    "enter", "backspace", "tab", "esc", "delete", "insert", "home", "end",
+    "pageup", "pagedown", "up", "down", "left", "right", "capslock",
+    "printscreen", "space",
+} | {f"f{n}" for n in range(1, 13)}
+
+
+def handle_keyboard(backend, payload: str) -> bool:
+    mods_s, sep, key = payload.partition("|")
+    if not sep or not key:
+        raise ValueError("Malformed keyboard command")
+    mods = []
+    for m in mods_s.split(","):
+        if not m:
+            continue
+        if m not in KB_MODIFIERS:
+            raise ValueError("Unknown keyboard modifier")
+        mods.append(KB_MODIFIERS[m])
+
+    is_char = len(key) == 1
+    if not is_char and key not in KB_NAMED_KEYS:
+        raise ValueError("Unsupported key")
+
+    # Shift alone: the client already sends the shifted character, just type it.
+    if is_char and all(m == "shift" for m in mods):
+        ok = backend.type_text(key, interval=0)
+    else:
+        name = key.lower() if is_char else key
+        ok = backend.hotkey(*mods, name) if mods else backend.press_key(name)
+
+    if not ok:
+        log(f"[WARN] keyboard input was not delivered (backend: {type(backend).__name__})")
+    return ok
+
 
 def open_terminal():
     if PLATFORM == "linux":
@@ -646,6 +688,11 @@ def _emit_chat_to_electron(label: str, text: str = None, file_name_b64: str = No
     print(CHAT_MARKER + json.dumps(payload), flush=True)
 
 
+def _loggable(cmd: str) -> str:
+    """Command text that is safe to write to the log: keystrokes can be passwords."""
+    return "kb:<redacted>" if cmd.startswith("kb:") else cmd
+
+
 def handle_command(cmd: str):
     """Handle a control command using the capability-tier backend."""
     backend = get_input_backend()
@@ -674,6 +721,9 @@ def handle_command(cmd: str):
             log(f"[SHORTCUT] {name} -> {'+'.join(keys)} delivered (backend: {type(backend).__name__})")
         else:
             log(f"[WARN] shortcut '{name}' was not delivered (backend: {type(backend).__name__})")
+            
+    elif cmd.startswith("kb:"):
+        handle_keyboard(backend, cmd[3:])
         
     elif cmd == "open_browser":
         webbrowser.open("https://")
@@ -770,6 +820,7 @@ def handle_control_client(conn: socket.socket, addr):
         return
 
     buf = b""
+    kb_seen = False  # log once per connection when live keyboard input first arrives
     try:
         while True:
             chunk = conn.recv(4096)
@@ -847,12 +898,16 @@ def handle_control_client(conn: socket.socket, addr):
                     # about grant/revoke via pushed STATUS lines, so it
                     # shouldn't normally be sending commands in this state,
                     # but never trust the client side alone to enforce that.
-                    log(f"[BLOCKED] {addr[0]} (id={cid}) sent '{cmd}' without control grant")
+                    log(f"[BLOCKED] {addr[0]} (id={cid}) sent '{_loggable(cmd)}' without control grant")
                     continue
                 try:
                     handle_command(cmd)
+                    if cmd.startswith("kb:") and not kb_seen:
+                        kb_seen = True
+                        log(f"[KB] live keyboard input is arriving from {addr[0]} (id={cid}); "
+                            f"backend: {type(backend).__name__}")
                 except Exception as e:
-                    log(f"[ERR] control command '{cmd}': {e}")
+                    log(f"[ERR] control command '{_loggable(cmd)}': {e}")
     except Exception as e:
         log(f"[ERR] control client {addr}: {e}")
     finally:

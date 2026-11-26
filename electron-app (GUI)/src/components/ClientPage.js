@@ -3,45 +3,29 @@ import { useNav } from '../App';
 import { H264Player } from '../h264Player';
 import { AudioPlayer } from '../audioPlayer';
 
-// All commands supported by server.py
-const SHORTCUTS = [
-  // Row 1 - Common
-  { label: 'Ctrl+C', cmd: 'shortcut:ctrl_c' },
-  { label: 'Ctrl+V', cmd: 'shortcut:ctrl_v' },
-  { label: 'Ctrl+X', cmd: 'shortcut:ctrl_x' },
-  { label: 'Ctrl+Z', cmd: 'shortcut:ctrl_z' },
-  { label: 'Ctrl+A', cmd: 'shortcut:ctrl_a' },
-  { label: 'Ctrl+Tab', cmd: 'shortcut:ctrl_tab' },
-  // Row 2 - Nav
-  { label: '↑', cmd: 'shortcut:arrow_up', accent: true },
-  { label: '↓', cmd: 'shortcut:arrow_down', accent: true },
-  { label: '←', cmd: 'shortcut:arrow_left', accent: true },
-  { label: '→', cmd: 'shortcut:arrow_right', accent: true },
-  { label: 'PgUp', cmd: 'shortcut:page_up' },
-  { label: 'PgDn', cmd: 'shortcut:page_down' },
-  // Row 3 - Special
-  { label: '⌫ Bksp', cmd: 'shortcut:backspace' },
-  { label: '↵ Enter', cmd: 'shortcut:enter' },
-  { label: 'Esc', cmd: 'shortcut:escape' },
-  { label: 'Tab', cmd: 'shortcut:tab' },
-  { label: 'Caps Lock', cmd: 'shortcut:caps_lock' },
-  { label: 'Delete', cmd: 'shortcut:delete' },
-  { label: 'Insert', cmd: 'shortcut:insert' },
-  { label: 'Home', cmd: 'shortcut:home' },
-  { label: 'End', cmd: 'shortcut:end' },
-  { label: 'Print Scrn', cmd: 'shortcut:print_screen' },
+// ── Live keyboard passthrough ────────────────────────────────────────────────
+// This is a laptop/desktop client, so the physical keyboard drives the host
+// directly instead of on-screen buttons. Each keydown becomes one command
+//   kb:<mods>|<key>      e.g.  kb:|a   kb:ctrl|c   kb:shift|tab   kb:|enter
+// which server.py (handle_keyboard) turns into a real key press on the host.
+const KB_NAMED_KEYS = {
+  Enter: 'enter', Backspace: 'backspace', Tab: 'tab', Escape: 'esc',
+  Delete: 'delete', Insert: 'insert', Home: 'home', End: 'end',
+  PageUp: 'pageup', PageDown: 'pagedown',
+  ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+  CapsLock: 'capslock', PrintScreen: 'printscreen', ' ': 'space',
+};
+for (let n = 1; n <= 12; n++) KB_NAMED_KEYS[`F${n}`] = `f${n}`;
+const KB_MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'OS']);
+
+// Not reachable from a physical keyboard: the OS grabs Alt+Tab / Alt+F4 / the
+// Win key before this window sees them, and app-launch / media actions aren't
+// keys at all. These stay as buttons; everything else is the live keyboard.
+const QUICK_ACTIONS = [
   { label: 'Alt+Tab', cmd: 'shortcut:alt_tab' },
   { label: 'Alt+F4', cmd: 'shortcut:alt_f4' },
   { label: 'Win+D', cmd: 'shortcut:win_d' },
   { label: 'Super', cmd: 'shortcut:super' },
-  // Row 4 - Function keys
-  { label: 'F1', cmd: 'shortcut:f1' }, { label: 'F2', cmd: 'shortcut:f2' },
-  { label: 'F3', cmd: 'shortcut:f3' }, { label: 'F4', cmd: 'shortcut:f4' },
-  { label: 'F5', cmd: 'shortcut:f5' }, { label: 'F6', cmd: 'shortcut:f6' },
-  { label: 'F7', cmd: 'shortcut:f7' }, { label: 'F8', cmd: 'shortcut:f8' },
-  { label: 'F9', cmd: 'shortcut:f9' }, { label: 'F10', cmd: 'shortcut:f10' },
-  { label: 'F11', cmd: 'shortcut:f11' }, { label: 'F12', cmd: 'shortcut:f12' },
-  // Row 5 - Apps
   { label: '🌐 Browser', cmd: 'open_browser' },
   { label: '📁 Folder', cmd: 'custom:open_folder' },
   { label: '🖥 Terminal', cmd: 'open_terminal' },
@@ -49,6 +33,30 @@ const SHORTCUTS = [
   { label: '🔊 Vol+', cmd: 'volume_up' },
   { label: '🔇 Mute', cmd: 'volume_mute' },
 ];
+
+// Returns the command string for a keydown event, or null if it shouldn't be
+// forwarded (a bare modifier, dead key, IME composition, media key, ...).
+function keyEventToCommand(e) {
+  if (e.isComposing || e.key === 'Dead' || e.key === 'Unidentified') return null;
+  if (KB_MODIFIER_KEYS.has(e.key)) return null;
+
+  const named = KB_NAMED_KEYS[e.key];
+  if (!named && e.key.length !== 1) return null;
+  const key = named || e.key;
+
+  // AltGr is reported as Ctrl+Alt on Windows; the character it produced
+  // ('@', '€', ...) is already in e.key, so don't forward those as modifiers.
+  const altGr = !!(e.getModifierState && e.getModifierState('AltGraph'));
+  const mods = [];
+  if (e.ctrlKey && !altGr) mods.push('ctrl');
+  if (e.altKey && !altGr) mods.push('alt');
+  // Shift is already baked into a typed character ('A', '!'); only forward it
+  // for named keys (Shift+Tab, Shift+Arrow...) or when combined with ctrl/alt/meta.
+  if (e.metaKey) mods.push('meta');
+  if (e.shiftKey && (named || mods.length)) mods.push('shift');
+
+  return `kb:${mods.join(',')}|${key}`;
+}
 
 // Every connection has to authenticate with server.py's pairing port
 // before it gets a session token — this default matches server.py's
@@ -97,9 +105,9 @@ export default function ClientPage() {
   const [controlPending, setControlPending] = useState(false); // connected, waiting on host to grant
   const [isCapturing, setIsCapturing] = useState(false);
   const [fps, setFps] = useState(0);
-  const [typeText, setTypeText] = useState('');
   const [lastCmdStatus, setLastCmdStatus] = useState('');
   const [zoom, setZoom] = useState(1);
+  const [audioVolume, setAudioVolume] = useState(1);
 
   // Chat — only usable at all if the host currently has it turned on
   // (pushed via CHAT_STATE right after the control channel connects, and
@@ -129,6 +137,7 @@ export default function ClientPage() {
   const playerRef = useRef(null);
   const audioRef = useRef(null);          // AudioPlayer for the host's shared audio
   const audioMutedRef = useRef(false);
+  const audioVolumeRef = useRef(1);
   const [audioMuted, setAudioMuted] = useState(false);
   const [hasAudio, setHasAudio] = useState(false); // the host is actually sending audio
   const pendingVideoRef = useRef([]); // H.264 frames that arrived before the <canvas> mounted
@@ -206,6 +215,7 @@ export default function ClientPage() {
     if (!password.trim()) { setErrorMsg('Enter the host password'); return; }
 
     setPhase('connecting');
+    ensureAudio().resume(); // inside the click: lets audio start without further prompts
 
     let targetHost = host.trim();
     if (connectMode === 'id') {
@@ -339,22 +349,31 @@ export default function ClientPage() {
     return () => { offFrame?.(); offEnded?.(); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Host audio (Settings → Audio on the host turns it on). "Play host audio"
-  // in this device's Settings decides whether it starts muted; the speaker
-  // button in the toolbar toggles it for this session.
+  // Host audio. The host shares system sound by default (Server page / Settings
+  // -> Audio). The player is created up-front (and unlocked by the Connect
+  // click) so sound starts the moment the host plays something.
+  const ensureAudio = useCallback(() => {
+    if (!audioRef.current) {
+      audioRef.current = new AudioPlayer();
+      audioRef.current.setMuted(audioMutedRef.current);
+      audioRef.current.setVolume(audioVolumeRef.current);
+    }
+    return audioRef.current;
+  }, []);
+
   useEffect(() => {
     let alive = true;
     window.api?.get?.('playRemoteAudio').then((v) => {
-      if (alive && v === false) { audioMutedRef.current = true; setAudioMuted(true); }
+      if (alive && v === false) { audioMutedRef.current = true; setAudioMuted(true); audioRef.current?.setMuted(true); }
+    }).catch(() => {});
+    window.api?.get?.('remoteAudioVolume').then((v) => {
+      if (alive && typeof v === 'number') { audioVolumeRef.current = v; setAudioVolume(v); audioRef.current?.setVolume(v); }
     }).catch(() => {});
     let announced = false;
     const off = window.api?.onScreenAudio?.((ab) => {
-      if (!audioRef.current) {
-        audioRef.current = new AudioPlayer();
-        audioRef.current.setMuted(audioMutedRef.current);
-      }
+      const player = ensureAudio();
       if (!announced) { announced = true; setHasAudio(true); }
-      audioRef.current.push(ab);
+      player.push(ab);
     });
     return () => {
       alive = false;
@@ -362,14 +381,23 @@ export default function ClientPage() {
       audioRef.current?.close();
       audioRef.current = null;
     };
-  }, []);
+  }, [ensureAudio]);
 
   const toggleAudioMute = () => {
     const next = !audioMutedRef.current;
     audioMutedRef.current = next;
     setAudioMuted(next);
-    audioRef.current?.setMuted(next);
+    ensureAudio().setMuted(next);
     if (!next) audioRef.current?.resume();
+  };
+
+  const changeAudioVolume = (v) => {
+    audioVolumeRef.current = v;
+    setAudioVolume(v);
+    ensureAudio().setVolume(v);
+    if (v > 0 && audioMutedRef.current) { audioMutedRef.current = false; setAudioMuted(false); audioRef.current?.setMuted(false); }
+    audioRef.current?.resume();
+    window.api?.set?.('remoteAudioVolume', v);
   };
 
   const setImgEl = useCallback((el) => {
@@ -531,12 +559,6 @@ export default function ClientPage() {
     else sendCmd('mouse_click');
   };
 
-  const sendTypeText = async () => {
-    if (!typeText.trim()) return;
-    await sendCmd(`key:${typeText}`);
-    setTypeText('');
-  };
-
   // Shared look of the two remote-screen elements (<img> for JPEG/PNG, <canvas>
   // for H.264); only the one matching the current codec is displayed.
   const screenStyle = (show) => ({
@@ -548,6 +570,35 @@ export default function ClientPage() {
     transformOrigin: 'center center',
     transition: zoom === 1 ? 'none' : 'transform 0.1s ease-out',
   });
+
+  // Forward the physical keyboard to the host while control is granted.
+  // Capture phase + preventDefault so Tab/F-keys/Ctrl+shortcuts act on the
+  // host and not on this window. Typing in a local text field (e.g. the chat
+  // box) is left alone so chat keeps working.
+  const kbOkRef = useRef(false);
+  useEffect(() => {
+    if (!controlEnabled) return undefined;
+    kbOkRef.current = false;
+    const onKeyDown = (e) => {
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      const cmd = keyEventToCommand(e);
+      if (!cmd) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // Surface delivery problems (key contents are deliberately not shown).
+      Promise.resolve(window.api?.controlSend(cmd)).then((res) => {
+        if (res && res.ok) {
+          if (!kbOkRef.current) { kbOkRef.current = true; setLastCmdStatus('✓ keyboard: sent to host'); }
+        } else {
+          kbOkRef.current = false;
+          setLastCmdStatus(`✗ keyboard: ${res?.error || 'not sent'}`);
+        }
+      });
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [controlEnabled]);
 
   // ── FORM ─────────────────────────────────────────────────────────────────────
   if (phase === 'form' || phase === 'connecting') {
@@ -729,20 +780,10 @@ export default function ClientPage() {
                 ✕ Disable Control
               </button>
 
-              {/* Type text */}
-              <div className="field">
-                <label className="field-label">Type Text</label>
-                <div style={{ display: 'flex', gap: 5 }}>
-                  <input
-                    className="field-input"
-                    style={{ flex: 1, fontSize: 12 }}
-                    placeholder="Type here..."
-                    value={typeText}
-                    onChange={e => setTypeText(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); sendTypeText(); } }}
-                  />
-                  <button className="btn btn-icon" onClick={sendTypeText}>⏎</button>
-                </div>
+              {/* Live keyboard hint (replaces the old Type Text box) */}
+              <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.5 }}>
+                ⌨ <strong>Keyboard is live.</strong> Whatever you type goes to the host.
+                Click a chat box to type locally.
               </div>
             </>
           )}
@@ -758,18 +799,13 @@ export default function ClientPage() {
           )}
         </div>
 
-        {/* Shortcut pad */}
+        {/* Quick actions: things a keyboard can't send */}
         {controlEnabled && (
           <div className="box">
-            <div className="box-title">Shortcuts</div>
+            <div className="box-title">Quick Actions</div>
             <div className="ctrl-grid">
-              {SHORTCUTS.map(s => (
-                <button
-                  key={s.cmd}
-                  className={`ctrl-btn ${s.accent ? 'accent' : ''}`}
-                  onClick={() => sendCmd(s.cmd)}
-                  title={s.cmd}
-                >
+              {QUICK_ACTIONS.map(s => (
+                <button key={s.cmd} className="ctrl-btn" onClick={() => sendCmd(s.cmd)} title={s.cmd}>
                   {s.label}
                 </button>
               ))}
@@ -864,15 +900,24 @@ export default function ClientPage() {
                 </button>
               )}
               <span className="toolbar-sep" />
-              {hasAudio && (
-                <button
-                  className={`btn btn-icon ${audioMuted ? '' : 'active'}`}
-                  onClick={toggleAudioMute}
-                  title={audioMuted ? 'Host audio is muted — click to listen' : 'Listening to host audio — click to mute'}
-                >
-                  {audioMuted ? '🔇 Audio off' : '🔊 Audio'}
-                </button>
-              )}
+              <button
+                className={`btn btn-icon ${audioMuted ? '' : 'active'}`}
+                onClick={toggleAudioMute}
+                title={
+                  audioMuted ? 'Host audio is muted — click to listen'
+                  : hasAudio ? 'Listening to host audio — click to mute'
+                  : 'Host audio on — waiting for the host to play sound'
+                }
+              >
+                {audioMuted ? '🔇 Audio off' : hasAudio ? '🔊 Audio' : '🔈 Audio'}
+              </button>
+              <input
+                type="range" min="0" max="1" step="0.05"
+                value={audioMuted ? 0 : audioVolume}
+                onChange={e => changeAudioVolume(parseFloat(e.target.value))}
+                title="Host audio volume"
+                style={{ width: 70, accentColor: 'var(--accent)' }}
+              />
               {isCapturing && (
                 <div className="live-badge">
                   <span className="pulse-dot" style={{ width: 5, height: 5 }} />
